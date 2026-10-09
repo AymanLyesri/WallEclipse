@@ -106,12 +106,19 @@ void HyprListener::handleRefresh() {
         if (auto ls = lastStaticWallpaper_.find(monitor); ls != lastStaticWallpaper_.end())
             lastStatic = ls->second;
 
+        // Slide direction from workspace order (None on first paint).
+        std::optional<int> fromWs;
+        if (lw != lastWorkspace_.end())
+            fromWs = lw->second;
+        SlideDir dir = slideDirForWorkspaces(fromWs, ws);
+        int fromId = fromWs.value_or(ws);
+
         switch (decide(shown, target, lastStatic)) {
         case SwitchAction::Skip:
             break;
         case SwitchAction::ShowStatic:
             if (h_.showStatic)
-                h_.showStatic(monitor, *target);
+                h_.showStatic(monitor, *target, dir, fromId, ws);
             lastStaticWallpaper_[monitor] = *target;
             currentWallpaper_[monitor] = *target;
             break;
@@ -122,7 +129,7 @@ void HyprListener::handleRefresh() {
             break;
         case SwitchAction::RestoreStatic:
             if (h_.showStatic)
-                h_.showStatic(monitor, *lastStatic);
+                h_.showStatic(monitor, *lastStatic, dir, fromId, ws);
             // Mapping still points at the video; record what's displayed
             // so returning to it re-spawns mpvpaper.
             currentWallpaper_[monitor] = *lastStatic;

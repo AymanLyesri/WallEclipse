@@ -1,8 +1,10 @@
 #include "walleclipse/WaylandBackend.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 #include <wayland-client.h>
 
@@ -41,9 +43,25 @@ struct OutputInfo {
     bool mapped = false;
 
     wl_buffer* buffer = nullptr;
-    void* poolData = nullptr;
-    size_t poolSize = 0;
     int bufW = 0, bufH = 0;
+
+    // Persistent double-buffered SHM pools: allocated once per output size,
+    // reused every frame. Per-frame mkstemp/mmap/munmap caused the visible
+    // stutter (page-table churn on 8MB per frame at 1080p). Pool memory stays
+    // mapped until resize/close, so a commit never outlives its storage.
+    struct Pool {
+        int fd = -1;
+        void* data = nullptr;
+        size_t size = 0;
+        wl_shm_pool* pool = nullptr;
+    };
+    Pool pools[2];
+    int poolIdx = 0;
+
+    // Last presented frame (ARGB8888, bufW x bufH) for transitions.
+    std::vector<uint8_t> lastFrame;
+    // Bumps on every setWallpaper; animation loops abort when stale.
+    uint64_t generation = 0;
 };
 
 struct WaylandBackend::Impl {
@@ -58,6 +76,7 @@ struct WaylandBackend::Impl {
     std::mutex mutex;
     std::thread dispatchThread;
     bool running = false;
+    std::string transitionName = "slide";
 
     void vlog(const std::string& m) {
         if (log)
@@ -70,6 +89,7 @@ namespace {
 // Forward declarations (defined below createShmFile).
 // Call with out->impl->mutex held.
 void attachLocked(OutputInfo* out);
+void attachPixelsLocked(OutputInfo* out, const std::vector<uint8_t>& argb, int w, int h);
 // (Re)create the layer surface + initial empty commit. True when a layer
 // surface exists afterwards (buffer still waits for configure).
 bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out);
@@ -89,6 +109,24 @@ void layerConfigure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial,
         attachLocked(out);
 }
 
+void destroyPoolsLocked(OutputInfo* out) {
+    for (auto& p : out->pools) {
+        if (p.pool) {
+            wl_shm_pool_destroy(p.pool);
+            p.pool = nullptr;
+        }
+        if (p.data) {
+            munmap(p.data, p.size);
+            p.data = nullptr;
+        }
+        if (p.fd >= 0) {
+            close(p.fd);
+            p.fd = -1;
+        }
+        p.size = 0;
+    }
+}
+
 void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
     auto* out = static_cast<OutputInfo*>(data);
     if (!out->impl)
@@ -98,6 +136,7 @@ void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
     std::lock_guard<std::mutex> lock(out->impl->mutex);
     out->configured = false;
     out->mapped = false;
+    ++out->generation; // cancel any in-flight slide
     if (out->layer) {
         zwlr_layer_surface_v1_destroy(out->layer);
         out->layer = nullptr;
@@ -110,11 +149,7 @@ void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
         wl_buffer_destroy(out->buffer);
         out->buffer = nullptr;
     }
-    if (out->poolData) {
-        munmap(out->poolData, out->poolSize);
-        out->poolData = nullptr;
-        out->poolSize = 0;
-    }
+    destroyPoolsLocked(out);
 }
 
 const zwlr_layer_surface_v1_listener kLayerListener = {layerConfigure, layerClosed};
@@ -207,6 +242,74 @@ int createShmFile(size_t size) {
     return fd;
 }
 
+void attachPixelsLocked(OutputInfo* out, const std::vector<uint8_t>& argb, int w,
+                          int h) {
+    if (!out->surface || !out->layer || !out->configured || !out->impl ||
+        !out->impl->shm || !out->impl->display)
+        return;
+    if (w <= 0 || h <= 0)
+        return;
+    if (argb.size() != static_cast<size_t>(w) * h * 4)
+        return;
+    size_t stride = static_cast<size_t>(w) * 4;
+    size_t size = stride * h;
+
+    // (Re)allocate the pool pair on size change; otherwise reuse mapped
+    // memory — no mkstemp/mmap/munmap on the frame path.
+    if (out->pools[0].size != size || out->pools[0].data == nullptr) {
+        destroyPoolsLocked(out);
+        for (auto& p : out->pools) {
+            int fd = createShmFile(size);
+            if (fd < 0) {
+                destroyPoolsLocked(out);
+                return;
+            }
+            void* data =
+                mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (data == MAP_FAILED) {
+                close(fd);
+                destroyPoolsLocked(out);
+                return;
+            }
+            wl_shm_pool* pool = wl_shm_create_pool(out->impl->shm, fd,
+                                                   static_cast<int32_t>(size));
+            if (!pool) {
+                munmap(data, size);
+                close(fd);
+                destroyPoolsLocked(out);
+                return;
+            }
+            p.fd = fd;
+            p.data = data;
+            p.size = size;
+            p.pool = pool;
+        }
+        out->poolIdx = 0;
+    }
+
+    auto& slot = out->pools[out->poolIdx++ % 2];
+    std::memcpy(slot.data, argb.data(), size);
+
+    wl_buffer* buffer = wl_shm_pool_create_buffer(slot.pool, 0, w, h,
+                                                  static_cast<int32_t>(stride),
+                                                  WL_SHM_FORMAT_ARGB8888);
+    if (!buffer)
+        return;
+
+    wl_surface_attach(out->surface, buffer, 0, 0);
+    wl_surface_damage_buffer(out->surface, 0, 0, w, h);
+    wl_surface_commit(out->surface);
+    wl_display_flush(out->impl->display);
+
+    if (out->buffer)
+        wl_buffer_destroy(out->buffer);
+    out->buffer = buffer;
+    out->bufW = w;
+    out->bufH = h;
+    out->mapped = true;
+    out->lastFrame = argb;
+}
+
 void attachLocked(OutputInfo* out) {
     if (!out->surface || !out->layer || !out->configured || !out->pending ||
         !out->impl || !out->impl->shm || !out->impl->display)
@@ -220,42 +323,7 @@ void attachLocked(OutputInfo* out) {
     }
 
     auto argb = scaleCoverArgb(*out->pending, w, h);
-    size_t stride = static_cast<size_t>(w) * 4;
-    size_t size = stride * h;
-
-    int fd = createShmFile(size);
-    if (fd < 0)
-        return;
-    void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return;
-    }
-    std::memcpy(data, argb.data(), size);
-
-    wl_shm_pool* pool =
-        wl_shm_create_pool(out->impl->shm, fd, static_cast<int32_t>(size));
-    wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, w, h,
-                                                  static_cast<int32_t>(stride),
-                                                  WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
-
-    wl_surface_attach(out->surface, buffer, 0, 0);
-    wl_surface_damage_buffer(out->surface, 0, 0, w, h);
-    wl_surface_commit(out->surface);
-    wl_display_flush(out->impl->display);
-
-    if (out->buffer)
-        wl_buffer_destroy(out->buffer);
-    if (out->poolData)
-        munmap(out->poolData, out->poolSize);
-    out->buffer = buffer;
-    out->poolData = data;
-    out->poolSize = size;
-    out->bufW = w;
-    out->bufH = h;
-    out->mapped = true;
+    attachPixelsLocked(out, argb, w, h);
 }
 
 bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out) {
@@ -363,30 +431,124 @@ static OutputInfo* findOutput(WaylandBackend::Impl* impl, const std::string& mon
 }
 
 bool WaylandBackend::setWallpaper(const std::string& monitor, const DecodedImage& img) {
-    return setWallpaper(monitor, std::make_shared<DecodedImage>(img));
+    return setWallpaper(monitor, std::make_shared<DecodedImage>(img), SlideDir::None);
 }
 
 bool WaylandBackend::setWallpaper(const std::string& monitor,
                                   std::shared_ptr<const DecodedImage> img) {
+    return setWallpaper(monitor, std::move(img), SlideDir::None);
+}
+
+bool WaylandBackend::setWallpaper(const std::string& monitor,
+                                  std::shared_ptr<const DecodedImage> img,
+                                  SlideDir dir) {
     if (!img || img->width <= 0 || img->height <= 0)
         return false;
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    OutputInfo* out = findOutput(impl_.get(), monitor);
-    if (!out)
-        return false;
-    if (!ensureSurfaceLocked(impl_.get(), out))
-        return false;
-    out->pending = std::move(img);
-    if (out->configured && out->mapped) {
-        attachLocked(out);
-    } else if (out->configured && out->surface) {
-        // Unmapped (hidden for mpvpaper): empty commit asks the compositor
-        // to remap; the configure handler attaches the pending image.
-        // (Fresh surfaces were already committed empty by ensureSurface.)
-        wl_surface_commit(out->surface);
-        wl_display_flush(impl_->display);
+
+    int w = 0, h = 0;
+    bool wasConfigured = false, wasMapped = false;
+    std::vector<uint8_t> oldFrame;
+    std::string transName;
+    uint64_t myGen = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        if (!out)
+            return false;
+        if (!ensureSurfaceLocked(impl_.get(), out))
+            return false;
+        out->pending = img;
+        ++out->generation;
+        myGen = out->generation;
+        wasConfigured = out->configured;
+        wasMapped = out->mapped;
+        w = out->cfgW > 0 ? out->cfgW : out->width;
+        h = out->cfgH > 0 ? out->cfgH : out->height;
+        if (w <= 0 || h <= 0) {
+            w = 1920;
+            h = 1080;
+        }
+        oldFrame = out->lastFrame;
+        transName = impl_->transitionName;
+    }
+
+    auto newArgb = scaleCoverArgb(*img, w, h);
+
+    auto isCurrent = [&] {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        return out && out->generation == myGen;
+    };
+
+    // Instant when: no direction, first paint, unmapped, or no cached frame.
+    bool haveOld = wasMapped && !oldFrame.empty() &&
+                   oldFrame.size() == newArgb.size();
+    if (dir == SlideDir::None || !wasConfigured || !haveOld) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        if (!out || out->generation != myGen)
+            return true; // superseded by a newer switch
+        if (!out->configured)
+            return true; // pends until configure (handler attaches)
+        if (out->mapped) {
+            attachPixelsLocked(out, newArgb, w, h);
+        } else if (out->surface) {
+            // Unmapped (hidden for mpvpaper): empty commit asks the
+            // compositor to remap; the configure handler attaches pending.
+            wl_surface_commit(out->surface);
+            wl_display_flush(impl_->display);
+        }
+        return true;
+    }
+
+    auto effect = makeTransition(transName);
+    if (!effect || effect->durationMs() <= 0) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        if (!out || out->generation != myGen)
+            return true;
+        if (out->configured && out->mapped)
+            attachPixelsLocked(out, newArgb, w, h);
+        return true;
+    }
+
+    int duration = effect->durationMs();
+    // 120fps target: even cadence on 60Hz and 144Hz panels. Deadline-based
+    // pacing (not fixed sleep) so frame work time doesn't drag the rate.
+    constexpr int kFps = 120;
+    int frames = std::max(1, duration * kFps / 1000);
+    auto frameNs = std::chrono::nanoseconds(1'000'000'000LL / kFps);
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 1; i <= frames; ++i) {
+        if (!isCurrent())
+            return true; // superseded (or hidden) mid-slide
+        double progress = static_cast<double>(i) / frames;
+        auto frame = effect->render(oldFrame, newArgb, w, h, progress, dir);
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            OutputInfo* out = findOutput(impl_.get(), monitor);
+            if (!out || out->generation != myGen)
+                return true;
+            if (!out->configured || !out->surface)
+                return true;
+            attachPixelsLocked(out, frame, w, h);
+        }
+        if (i < frames)
+            std::this_thread::sleep_until(t0 + frameNs * i);
     }
     return true;
+}
+
+void WaylandBackend::setTransition(const std::string& name) {
+    if (!makeTransition(name))
+        return;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->transitionName = name;
+}
+
+std::string WaylandBackend::transition() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->transitionName;
 }
 
 void WaylandBackend::hideMonitor(const std::string& monitor) {
@@ -395,6 +557,7 @@ void WaylandBackend::hideMonitor(const std::string& monitor) {
     if (!out)
         return;
     out->pending.reset(); // stay hidden across future configures
+    ++out->generation;    // cancel any in-flight slide
     if (!out->surface || !out->mapped)
         return; // already unmapped: no commit needed
     wl_surface_attach(out->surface, nullptr, 0, 0);

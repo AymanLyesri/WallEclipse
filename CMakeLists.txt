@@ -48,6 +48,7 @@ add_library(walleclipse_core STATIC
   src/ConfigStore.cpp
   src/ImageLoader.cpp
   src/Preloader.cpp
+  src/Transition.cpp
   src/WaylandBackend.cpp
   src/HyprListener.cpp
   src/MediaDelegate.cpp
@@ -76,4 +77,8 @@ if(BUILD_TESTING)
   add_executable(test_image tests/test_image.cpp)
   target_link_libraries(test_image PRIVATE walleclipse_core)
   add_test(NAME image COMMAND test_image)
+
+  add_executable(test_transition tests/test_transition.cpp src/Transition.cpp)
+  target_include_directories(test_transition PRIVATE include)
+  add_test(NAME transition COMMAND test_transition)
 endif()

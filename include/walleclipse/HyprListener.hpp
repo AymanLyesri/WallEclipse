@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "walleclipse/Transition.hpp"
+
 // Hyprland event listener + wallpaper switch orchestrator.
 // Merges wallpaper-loop.c semantics: socket2.sock event filter
 // (workspace/focusedmon), 100ms debounce, single-snapshot monitor
@@ -13,10 +15,14 @@
 class HyprListener {
 public:
     // Callbacks wired by main(): render static, delegate animated.
+    // showStatic receives the slide direction derived from workspace order
+    // (None on first paint) plus the from/to workspace ids for logging.
     struct Handlers {
         std::function<std::vector<std::string>()> listMonitors;
         std::function<bool(const std::string& monitor, int workspace, std::string& outPath)> lookup;
-        std::function<void(const std::string& monitor, const std::string& path)> showStatic;
+        std::function<void(const std::string& monitor, const std::string& path, SlideDir dir,
+                           int fromWs, int toWs)>
+            showStatic;
         std::function<void(const std::string& monitor, const std::string& path)> showAnimated;
         std::function<void(const std::string& where, const std::string& msg)> onError;
         std::function<void(const std::string& where, const std::string& msg)> onInfo;

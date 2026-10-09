@@ -189,7 +189,13 @@ int main(int argc, char** argv) {
         out = *v;
         return true;
     };
-    handlers.showStatic = [&](const std::string& mon, const std::string& path) {
+    handlers.showStatic = [&](const std::string& mon, const std::string& path, SlideDir dir,
+                                int fromWs, int toWs) {
+        logLine("slide", mon + " ws " + std::to_string(fromWs) + "->" + std::to_string(toWs) +
+                             " dir=" + (dir == SlideDir::Forward    ? "forward"
+                                        : dir == SlideDir::Backward ? "backward"
+                                                                   : "none") +
+                             " " + path);
         // Animated slipped into a static slot? Delegate (never render garbage).
         if (isMediaWallpaper(path)) {
             backend.hideMonitor(mon);
@@ -209,7 +215,7 @@ int main(int argc, char** argv) {
             return;
         }
         MediaDelegate::stopForMonitor(mon); // leaving video -> kill mpvpaper first
-        if (!backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img)))
+        if (!backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img), dir))
             logLine("change_wallpaper", "unknown monitor '" + mon + "'");
         writeCurrentConf(path);
         std::thread([path] { MediaDelegate::applyTheme(path); }).detach();

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "walleclipse/ImageLoader.hpp"
+#include "walleclipse/Transition.hpp"
 
 // Direct Wayland backend: one wlr-layer-shell background surface per
 // output, SHM buffers scaled to the output mode. Replaces hyprpaper's
@@ -33,8 +34,18 @@ public:
     // The image is attached immediately when the surface is configured,
     // otherwise it pends until configure arrives (never attaches early:
     // that is a fatal protocol error).
+    // The SlideDir overload animates via the active TransitionEffect
+    // (default "slide"); SlideDir::None (and the 2-arg overload) attaches
+    // instantly. Direction comes from workspace order (see Transition.hpp).
     bool setWallpaper(const std::string& monitor, const DecodedImage& img);
     bool setWallpaper(const std::string& monitor, std::shared_ptr<const DecodedImage> img);
+    bool setWallpaper(const std::string& monitor, std::shared_ptr<const DecodedImage> img,
+                      SlideDir dir);
+
+    // Swap the transition effect ("slide", "none", ...). Unknown names are
+    // ignored. Future effects plug in via makeTransition().
+    void setTransition(const std::string& name);
+    std::string transition() const;
 
     // Unmap the layer surface (used when mpvpaper takes over audio/video).
     void hideMonitor(const std::string& monitor);
