@@ -53,6 +53,7 @@ Deps: `wayland-client`, `wlr-protocols` not required (vendored),
 ./build/walleclipse --once DP-2 ~/wall.jpg   # smoke test one render
 ./build/walleclipse set DP-2 3 ~/wall.jpg
 ./build/walleclipse preload ~/wall.jpg
+./build/walleclipse reload   # re-read config + re-apply current
 ./build/walleclipse list
 ```
 

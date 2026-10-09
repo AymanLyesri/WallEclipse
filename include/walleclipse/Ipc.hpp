@@ -9,6 +9,7 @@
 //   SET <monitor> <ws> <path> update config + show immediately
 //   CURRENT                   print current.conf content
 //   LIST                      print "<monitor> <ws> <path>" lines
+//   RELOAD                    re-read config, preload new paths, re-apply current
 //   QUIT                      stop the daemon (local user only)
 class Ipc {
 public:    struct Handlers {
@@ -16,6 +17,7 @@ public:    struct Handlers {
         std::function<bool(const std::string& mon, int ws, const std::string& path)> set;
         std::function<std::string()> current;
         std::function<std::string()> list;
+        std::function<void()> reload;
         std::function<void()> quit;
     };
 

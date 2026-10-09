@@ -48,6 +48,7 @@ void printHelp(const char* argv0) {
               << "  " << argv0 << " --once MON PATH  render once, exit\n"
               << "  " << argv0 << " set MON WS PATH  set workspace wallpaper\n"
               << "  " << argv0 << " preload PATH     preload into daemon cache\n"
+              << "  " << argv0 << " reload           re-read config + re-apply current\n"
               << "  " << argv0 << " current|list     query daemon\n";
 }
 
@@ -81,21 +82,25 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::string req = "SET " + std::string(argv[2]) + " " + argv[3] + " " + argv[4];
-        std::cout << Ipc::call(req);
-        return 0;
+        std::string reply = Ipc::call(req);
+        std::cout << reply;
+        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
     }
     if (argc >= 2 && std::strcmp(argv[1], "preload") == 0) {
         if (argc < 3) {
             std::cerr << "Usage: walleclipse preload <path>\n";
             return 2;
         }
-        std::cout << Ipc::call("PRELOAD " + std::string(argv[2]));
-        return 0;
+        std::string reply = Ipc::call("PRELOAD " + std::string(argv[2]));
+        std::cout << reply;
+        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
     }
     if (argc >= 2 &&
-        (std::strcmp(argv[1], "current") == 0 || std::strcmp(argv[1], "list") == 0)) {
-        std::cout << Ipc::call(argv[1]);
-        return 0;
+        (std::strcmp(argv[1], "current") == 0 || std::strcmp(argv[1], "list") == 0 ||
+         std::strcmp(argv[1], "reload") == 0)) {
+        std::string reply = Ipc::call(argv[1]);
+        std::cout << reply;
+        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
     }
     if (argc >= 2 &&
         (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
@@ -131,6 +136,13 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
         return 0;
+    }
+
+    // Unknown subcommand: fail instead of starting a second daemon.
+    if (argc >= 2 && argv[1][0] != '-') {
+        std::cerr << "Unknown command '" << argv[1] << "'\n";
+        printHelp(argv[0]);
+        return 2;
     }
 
     // ---- Daemon ----
@@ -212,6 +224,7 @@ int main(int argc, char** argv) {
     handlers.onInfo = [](const std::string& w, const std::string& m) { logLine(w, m); };
 
     HyprListener listener(std::move(handlers));
+    HyprListener* activeListener = &listener;
 
     // IPC thread: SET updates config + shows immediately (compat shim for
     // set-wallpaper.sh callers during migration).
@@ -219,6 +232,14 @@ int main(int argc, char** argv) {
     std::thread ipcThread([&] {
         Ipc::Handlers ih;
         ih.preload = [&](const std::string& p) { preloader.preloadOne(p); };
+        ih.reload = [&] {
+            // Re-read config from disk (picks up external edits), preload
+            // any new paths, then re-apply current workspace wallpapers.
+            preloader.preloadAll(store);
+            if (activeListener)
+                activeListener->applyCurrent();
+            logLine("ipc", "reloaded config");
+        };
         ih.set = [&](const std::string& mon, int ws, const std::string& path) {
             if (!store.setWallpaper(mon, ws, path))
                 return false;

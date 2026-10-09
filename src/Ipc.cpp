@@ -110,6 +110,10 @@ bool Ipc::serve(Handlers h) {
             reply = h.current ? h.current() : "\n";
         } else if (line == "LIST" || line == "LIST\n" || upper == "LIST") {
             reply = h.list ? h.list() : "\n";
+        } else if (upper == "RELOAD") {
+            if (h.reload)
+                h.reload();
+            reply = "OK\n";
         } else if (line == "QUIT" || line == "QUIT\n" || upper == "QUIT") {
             reply = "OK\n";
             stop = true;
