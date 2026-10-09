@@ -64,6 +64,25 @@ bool HyprListener::isRefreshEvent(const std::string& line) {
            line.find("focusedmon") != std::string::npos;
 }
 
+HyprListener::SwitchAction
+HyprListener::decide(const std::optional<std::string>& shown,
+                     const std::optional<std::string>& target,
+                     const std::optional<std::string>& lastStatic) {
+    bool showingAnimated = shown.has_value() && isMediaWallpaper(*shown);
+    if (!target.has_value() || target->empty()) {
+        // Empty/missing slot: static buffers persist, but an unmapped
+        // surface (animated was showing) must restore last static.
+        if (showingAnimated && lastStatic.has_value() && !lastStatic->empty())
+            return SwitchAction::RestoreStatic;
+        return SwitchAction::Skip;
+    }
+    if (isMediaWallpaper(*target))
+        return (shown.has_value() && *shown == *target) ? SwitchAction::Skip
+                                                        : SwitchAction::ShowAnimated;
+    return (shown.has_value() && *shown == *target) ? SwitchAction::Skip
+                                                    : SwitchAction::ShowStatic;
+}
+
 void HyprListener::handleRefresh() {
     std::string text = execCapture("hyprctl monitors -j | jq -r '.[] | \"\\(.name) \\(.activeWorkspace.id)\"'");
     for (auto& [monitor, ws] : parseSnapshotLines(text)) {
@@ -72,29 +91,43 @@ void HyprListener::handleRefresh() {
             continue; // unchanged workspace
 
         std::string path;
-        if (!h_.lookup(monitor, ws, path)) {
-            if (h_.onInfo)
-                h_.onInfo("change_wallpaper", "No wallpaper config for '" + monitor +
-                                                   "' workspace " + std::to_string(ws));
-            lastWorkspace_[monitor] = ws;
-            continue;
+        std::optional<std::string> target;
+        if (h_.lookup(monitor, ws, path)) {
+            target = path;
+        } else if (h_.onInfo) {
+            h_.onInfo("change_wallpaper", "No wallpaper config for '" + monitor +
+                                               "' workspace " + std::to_string(ws));
         }
-        if (path.empty()) { // empty slot: expected, keep previous
-            lastWorkspace_[monitor] = ws;
-            continue;
+
+        std::optional<std::string> shown;
+        if (auto cw = currentWallpaper_.find(monitor); cw != currentWallpaper_.end())
+            shown = cw->second;
+        std::optional<std::string> lastStatic;
+        if (auto ls = lastStaticWallpaper_.find(monitor); ls != lastStaticWallpaper_.end())
+            lastStatic = ls->second;
+
+        switch (decide(shown, target, lastStatic)) {
+        case SwitchAction::Skip:
+            break;
+        case SwitchAction::ShowStatic:
+            if (h_.showStatic)
+                h_.showStatic(monitor, *target);
+            lastStaticWallpaper_[monitor] = *target;
+            currentWallpaper_[monitor] = *target;
+            break;
+        case SwitchAction::ShowAnimated:
+            if (h_.showAnimated)
+                h_.showAnimated(monitor, *target);
+            currentWallpaper_[monitor] = *target;
+            break;
+        case SwitchAction::RestoreStatic:
+            if (h_.showStatic)
+                h_.showStatic(monitor, *lastStatic);
+            // Mapping still points at the video; record what's displayed
+            // so returning to it re-spawns mpvpaper.
+            currentWallpaper_[monitor] = *lastStatic;
+            break;
         }
-        auto cw = currentWallpaper_.find(monitor);
-        if (cw != currentWallpaper_.end() && cw->second == path) {
-            lastWorkspace_[monitor] = ws;
-            continue; // same image, new workspace id
-        }
-        if (h_.showStatic && h_.showAnimated) {
-            if (isMediaWallpaper(path))
-                h_.showAnimated(monitor, path);
-            else
-                h_.showStatic(monitor, path);
-        }
-        currentWallpaper_[monitor] = path;
         lastWorkspace_[monitor] = ws;
     }
 }
@@ -103,6 +136,12 @@ void HyprListener::applyCurrent() {
     lastWorkspace_.clear();
     currentWallpaper_.clear();
     handleRefresh();
+}
+
+void HyprListener::noteShown(const std::string& monitor, const std::string& path) {
+    currentWallpaper_[monitor] = path;
+    if (!isMediaWallpaper(path))
+        lastStaticWallpaper_[monitor] = path;
 }
 
 void HyprListener::run() {

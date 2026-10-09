@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -65,6 +66,10 @@ bool Ipc::serve(Handlers h) {
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0)
         return false;
+    // Spawned helpers (mpvpaper, wal-theme) must not inherit IPC fds:
+    // an inherited client socket delays the client's EOF until the
+    // helper exits (wal-theme on video takes seconds).
+    fcntl(srv, F_SETFD, FD_CLOEXEC);
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, spath.c_str(), sizeof(addr.sun_path) - 1);
@@ -82,6 +87,7 @@ bool Ipc::serve(Handlers h) {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0)
             continue;
+        fcntl(cli, F_SETFD, FD_CLOEXEC);
         std::string req = readAll(cli);
         // First line is the command; reject embedded NULs implicitly via find.
         size_t nl = req.find('\n');

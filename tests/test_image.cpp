@@ -45,9 +45,32 @@ int main() {
     CHECK(!HyprListener::isRefreshEvent("activewindow>>class,title"));
     CHECK(!HyprListener::isRefreshEvent(""));
 
+    // SwitchAction decision matrix (regression: animated -> empty slot
+    // must restore last static instead of black-screening).
+    using SA = HyprListener::SwitchAction;
+    auto dec = HyprListener::decide;
+    std::optional<std::string> none;
+    // Empty/missing slot after static: keep persisting buffer.
+    CHECK(dec(std::string("/a.jpg"), std::string(""), std::string("/a.jpg")) == SA::Skip);
+    CHECK(dec(std::string("/a.jpg"), none, std::string("/a.jpg")) == SA::Skip);
+    // Empty/missing slot after animated: restore last static.
+    CHECK(dec(std::string("/v.mp4"), std::string(""), std::string("/a.jpg")) == SA::RestoreStatic);
+    CHECK(dec(std::string("/v.mp4"), none, std::string("/a.jpg")) == SA::RestoreStatic);
+    // Animated showing, empty slot, no static ever: nothing to restore.
+    CHECK(dec(std::string("/v.mp4"), std::string(""), none) == SA::Skip);
+    // Fresh boot, empty slot: nothing to show.
+    CHECK(dec(none, std::string(""), none) == SA::Skip);
+    // Normal switches.
+    CHECK(dec(std::string("/a.jpg"), std::string("/b.jpg"), std::string("/a.jpg")) == SA::ShowStatic);
+    CHECK(dec(std::string("/a.jpg"), std::string("/a.jpg"), std::string("/a.jpg")) == SA::Skip);
+    CHECK(dec(std::string("/a.jpg"), std::string("/v.mp4"), std::string("/a.jpg")) == SA::ShowAnimated);
+    CHECK(dec(std::string("/v.mp4"), std::string("/v.mp4"), std::string("/a.jpg")) == SA::Skip);
+    CHECK(dec(std::string("/v.mp4"), std::string("/a.jpg"), std::string("/a.jpg")) == SA::ShowStatic);
+    CHECK(dec(none, std::string("/a.jpg"), none) == SA::ShowStatic);
+    CHECK(dec(none, std::string("/v.mp4"), none) == SA::ShowAnimated);
+
     // Missing file decodes to nullopt (daemon must keep old wallpaper).
     CHECK(!loadImage("/nonexistent/walleclipse-test.jpg").has_value());
-
     // Synthetic 2x1 red/green image scales to cover 4x4 without crashing,
     // output is ARGB8888 opaque.
     DecodedImage tiny;

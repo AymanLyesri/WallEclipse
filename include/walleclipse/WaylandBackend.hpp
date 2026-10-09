@@ -30,7 +30,11 @@ public:
 
     // Show a decoded image fullscreen on a monitor (cover-fit).
     // Returns false when the monitor is unknown or not yet configured.
+    // The image is attached immediately when the surface is configured,
+    // otherwise it pends until configure arrives (never attaches early:
+    // that is a fatal protocol error).
     bool setWallpaper(const std::string& monitor, const DecodedImage& img);
+    bool setWallpaper(const std::string& monitor, std::shared_ptr<const DecodedImage> img);
 
     // Unmap the layer surface (used when mpvpaper takes over audio/video).
     void hideMonitor(const std::string& monitor);

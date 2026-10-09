@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,10 @@ public:
     // One-shot: query monitors once and apply current wallpapers.
     void applyCurrent();
 
+    // Record an out-of-band show (IPC `set` bypasses the event flow);
+    // keeps animated-restore state accurate.
+    void noteShown(const std::string& monitor, const std::string& path);
+
     // Blocking event loop (returns on socket EOF/error).
     void run();
 
@@ -33,6 +38,17 @@ public:
     // of "<name> <workspaceId>" into pairs. Skips blanks/special.
     static std::vector<std::pair<std::string, int>>
     parseSnapshotLines(const std::string& text);
+
+    // What to do on a workspace switch. `shown` = path currently displayed
+    // (nullopt when unknown), `target` = new mapping (nullopt = no key,
+    // "" = empty slot), `lastStatic` = last static path shown on this
+    // monitor. RestoreStatic re-shows the last static image when the
+    // surface is unmapped (an animated wallpaper was showing and the new
+    // slot is empty) — otherwise the screen goes black.
+    enum class SwitchAction { Skip, ShowStatic, ShowAnimated, RestoreStatic };
+    static SwitchAction decide(const std::optional<std::string>& shown,
+                               const std::optional<std::string>& target,
+                               const std::optional<std::string>& lastStatic);
 
     // Pure helper: does a socket2 line merit a wallpaper refresh?
     // Mirrors wallpaper-loop.c ("workspace" substring incl. moveworkspace,
@@ -45,4 +61,7 @@ private:
     Handlers h_;
     std::map<std::string, int> lastWorkspace_;
     std::map<std::string, std::string> currentWallpaper_;
+    // Last static path per monitor (animated workspaces unmap the layer
+    // surface, so an empty slot must restore this instead of black-screen).
+    std::map<std::string, std::string> lastStaticWallpaper_;
 };

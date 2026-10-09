@@ -170,6 +170,15 @@ int main(int argc, char** argv) {
     }
 
     std::string currentConf = store.baseDir() + "/current.conf";
+    auto writeCurrentConf = [&](const std::string& path) {
+        std::string expanded;
+        ConfigStore::expandPath(path, expanded);
+        if (FILE* fp = std::fopen(currentConf.c_str(), "w")) {
+            std::fputs((expanded.empty() ? path : expanded).c_str(), fp);
+            std::fputc('\n', fp);
+            std::fclose(fp);
+        }
+    };
 
     HyprListener::Handlers handlers;
     handlers.listMonitors = [&] { return queryMonitors(); };
@@ -200,17 +209,9 @@ int main(int argc, char** argv) {
             return;
         }
         MediaDelegate::stopForMonitor(mon); // leaving video -> kill mpvpaper first
-        if (!backend.setWallpaper(mon, *img))
+        if (!backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img)))
             logLine("change_wallpaper", "unknown monitor '" + mon + "'");
-        {
-            std::string expanded;
-            ConfigStore::expandPath(path, expanded);
-            if (FILE* fp = std::fopen(currentConf.c_str(), "w")) {
-                std::fputs((expanded.empty() ? path : expanded).c_str(), fp);
-                std::fputc('\n', fp);
-                std::fclose(fp);
-            }
-        }
+        writeCurrentConf(path);
         std::thread([path] { MediaDelegate::applyTheme(path); }).detach();
     };
     handlers.showAnimated = [&](const std::string& mon, const std::string& path) {
@@ -218,6 +219,7 @@ int main(int argc, char** argv) {
         std::string expanded;
         ConfigStore::expandPath(path, expanded);
         MediaDelegate::playOnMonitor(mon, expanded.empty() ? path : expanded);
+        writeCurrentConf(path);
         MediaDelegate::applyTheme(path);
     };
     handlers.onError = [](const std::string& w, const std::string& m) { logLine(w, m); };
@@ -249,12 +251,18 @@ int main(int argc, char** argv) {
                 std::string expanded;
                 ConfigStore::expandPath(out, expanded);
                 MediaDelegate::playOnMonitor(mon, expanded.empty() ? out : expanded);
+                if (activeListener)
+                    activeListener->noteShown(mon, out);
+                writeCurrentConf(out);
             } else {
                 preloader.preloadOne(out);
                 auto img = preloader.get(out);
                 if (img) {
                     MediaDelegate::stopForMonitor(mon);
-                    backend.setWallpaper(mon, *img);
+                    backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img));
+                    if (activeListener)
+                        activeListener->noteShown(mon, out);
+                    writeCurrentConf(out);
                 }
             }
             MediaDelegate::applyTheme(out);

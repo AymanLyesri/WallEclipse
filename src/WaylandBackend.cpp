@@ -14,6 +14,7 @@
 #include "xdg-output-unstable-v1-client.h"
 
 struct OutputInfo {
+    WaylandBackend::Impl* impl = nullptr;
     wl_output* output = nullptr;
     zxdg_output_v1* xdg = nullptr;
     std::string name;
@@ -26,6 +27,18 @@ struct OutputInfo {
     uint32_t configureSerial = 0;
     bool configured = false;
     int cfgW = 0, cfgH = 0;
+
+    // Image waiting for (or surviving) configure. Layer-shell forbids
+    // attaching a buffer before the first acked configure, and a `closed`
+    // event (e.g. `hyprctl reload`) unmaps us — either way the pending
+    // image is (re-)attached when configure arrives, never before.
+    std::shared_ptr<const DecodedImage> pending;
+
+    // False until a buffer is successfully attached. Attaching nil
+    // (hideMonitor) unmaps the surface: per protocol it returns to the
+    // post-get_layer_surface state, so re-showing needs an empty commit
+    // + configure + attach, not a direct attach (that's a fatal error).
+    bool mapped = false;
 
     wl_buffer* buffer = nullptr;
     void* poolData = nullptr;
@@ -54,19 +67,54 @@ struct WaylandBackend::Impl {
 
 namespace {
 
+// Forward declarations (defined below createShmFile).
+// Call with out->impl->mutex held.
+void attachLocked(OutputInfo* out);
+// (Re)create the layer surface + initial empty commit. True when a layer
+// surface exists afterwards (buffer still waits for configure).
+bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out);
+
 void layerConfigure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial,
                      uint32_t width, uint32_t height) {
     auto* out = static_cast<OutputInfo*>(data);
     zwlr_layer_surface_v1_ack_configure(layer, serial);
+    if (!out->impl)
+        return;
+    std::lock_guard<std::mutex> lock(out->impl->mutex);
     out->configureSerial = serial;
     out->configured = true;
     out->cfgW = static_cast<int>(width);
     out->cfgH = static_cast<int>(height);
+    if (out->pending)
+        attachLocked(out);
 }
 
 void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
     auto* out = static_cast<OutputInfo*>(data);
+    if (!out->impl)
+        return;
+    // Surface is gone (reload/reconfigure): tear down so the next
+    // setWallpaper recreates it and waits for configure before attaching.
+    std::lock_guard<std::mutex> lock(out->impl->mutex);
     out->configured = false;
+    out->mapped = false;
+    if (out->layer) {
+        zwlr_layer_surface_v1_destroy(out->layer);
+        out->layer = nullptr;
+    }
+    if (out->surface) {
+        wl_surface_destroy(out->surface);
+        out->surface = nullptr;
+    }
+    if (out->buffer) {
+        wl_buffer_destroy(out->buffer);
+        out->buffer = nullptr;
+    }
+    if (out->poolData) {
+        munmap(out->poolData, out->poolSize);
+        out->poolData = nullptr;
+        out->poolSize = 0;
+    }
 }
 
 const zwlr_layer_surface_v1_listener kLayerListener = {layerConfigure, layerClosed};
@@ -118,6 +166,7 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
         wl_output* o = static_cast<wl_output*>(
             wl_registry_bind(registry, name, &wl_output_interface, v));
         auto info = std::make_unique<OutputInfo>();
+        info->impl = self;
         info->output = o;
         wl_output_add_listener(o, &kOutputListener, info.get());
         if (self->xdgOutMgr) {
@@ -158,6 +207,88 @@ int createShmFile(size_t size) {
     return fd;
 }
 
+void attachLocked(OutputInfo* out) {
+    if (!out->surface || !out->layer || !out->configured || !out->pending ||
+        !out->impl || !out->impl->shm || !out->impl->display)
+        return;
+
+    int w = out->cfgW > 0 ? out->cfgW : out->width;
+    int h = out->cfgH > 0 ? out->cfgH : out->height;
+    if (w <= 0 || h <= 0) {
+        w = 1920;
+        h = 1080;
+    }
+
+    auto argb = scaleCoverArgb(*out->pending, w, h);
+    size_t stride = static_cast<size_t>(w) * 4;
+    size_t size = stride * h;
+
+    int fd = createShmFile(size);
+    if (fd < 0)
+        return;
+    void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    std::memcpy(data, argb.data(), size);
+
+    wl_shm_pool* pool =
+        wl_shm_create_pool(out->impl->shm, fd, static_cast<int32_t>(size));
+    wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, w, h,
+                                                  static_cast<int32_t>(stride),
+                                                  WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+
+    wl_surface_attach(out->surface, buffer, 0, 0);
+    wl_surface_damage_buffer(out->surface, 0, 0, w, h);
+    wl_surface_commit(out->surface);
+    wl_display_flush(out->impl->display);
+
+    if (out->buffer)
+        wl_buffer_destroy(out->buffer);
+    if (out->poolData)
+        munmap(out->poolData, out->poolSize);
+    out->buffer = buffer;
+    out->poolData = data;
+    out->poolSize = size;
+    out->bufW = w;
+    out->bufH = h;
+    out->mapped = true;
+}
+
+bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out) {
+    if (!impl || !impl->compositor || !impl->layerShell || !out->output)
+        return false;
+    if (out->layer)
+        return true;
+    out->surface = wl_compositor_create_surface(impl->compositor);
+    if (!out->surface)
+        return false;
+    out->layer = zwlr_layer_shell_v1_get_layer_surface(
+        impl->layerShell, out->surface, out->output,
+        ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "walleclipse");
+    if (!out->layer) {
+        wl_surface_destroy(out->surface);
+        out->surface = nullptr;
+        return false;
+    }
+    zwlr_layer_surface_v1_set_size(out->layer, 0, 0);
+    zwlr_layer_surface_v1_set_anchor(
+        out->layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                        ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                        ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    zwlr_layer_surface_v1_set_exclusive_zone(out->layer, -1);
+    zwlr_layer_surface_v1_add_listener(out->layer, &kLayerListener, out);
+    out->configured = false;
+    // Initial commit WITHOUT a buffer: compositor replies with configure,
+    // only then may a buffer be attached.
+    wl_surface_commit(out->surface);
+    return true;
+}
+
 } // namespace
 
 WaylandBackend::WaylandBackend() : impl_(std::make_unique<Impl>()) {}
@@ -183,21 +314,12 @@ bool WaylandBackend::init(LogFn log) {
         return false;
     }
 
-    // Create one background layer surface per output.
-    for (auto& [wlOut, info] : impl_->outputs) {
-        info->surface = wl_compositor_create_surface(impl_->compositor);
-        info->layer = zwlr_layer_shell_v1_get_layer_surface(
-            impl_->layerShell, info->surface, info->output,
-            ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "walleclipse");
-        zwlr_layer_surface_v1_set_size(info->layer, 0, 0);
-        zwlr_layer_surface_v1_set_anchor(
-            info->layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                             ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-                             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-        zwlr_layer_surface_v1_set_exclusive_zone(info->layer, -1);
-        zwlr_layer_surface_v1_add_listener(info->layer, &kLayerListener, info.get());
-        wl_surface_commit(info->surface);
+    // Create one background layer surface per output (initial empty
+    // commit; buffers attach only after configure — see attachLocked).
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        for (auto& [wlOut, info] : impl_->outputs)
+            ensureSurfaceLocked(impl_.get(), info.get());
     }
     wl_display_roundtrip(impl_->display);
 
@@ -241,68 +363,44 @@ static OutputInfo* findOutput(WaylandBackend::Impl* impl, const std::string& mon
 }
 
 bool WaylandBackend::setWallpaper(const std::string& monitor, const DecodedImage& img) {
+    return setWallpaper(monitor, std::make_shared<DecodedImage>(img));
+}
+
+bool WaylandBackend::setWallpaper(const std::string& monitor,
+                                  std::shared_ptr<const DecodedImage> img) {
+    if (!img || img->width <= 0 || img->height <= 0)
+        return false;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     OutputInfo* out = findOutput(impl_.get(), monitor);
-    if (!out || !out->surface || !out->layer)
+    if (!out)
         return false;
-
-    int w = out->cfgW > 0 ? out->cfgW : out->width;
-    int h = out->cfgH > 0 ? out->cfgH : out->height;
-    w *= 1;
-    h *= 1;
-    if (w <= 0 || h <= 0) {
-        w = 1920;
-        h = 1080;
+    if (!ensureSurfaceLocked(impl_.get(), out))
+        return false;
+    out->pending = std::move(img);
+    if (out->configured && out->mapped) {
+        attachLocked(out);
+    } else if (out->configured && out->surface) {
+        // Unmapped (hidden for mpvpaper): empty commit asks the compositor
+        // to remap; the configure handler attaches the pending image.
+        // (Fresh surfaces were already committed empty by ensureSurface.)
+        wl_surface_commit(out->surface);
+        wl_display_flush(impl_->display);
     }
-
-    auto argb = scaleCoverArgb(img, w, h);
-    size_t stride = static_cast<size_t>(w) * 4;
-    size_t size = stride * h;
-
-    int fd = createShmFile(size);
-    if (fd < 0)
-        return false;
-    void* data =
-        mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return false;
-    }
-    std::memcpy(data, argb.data(), size);
-
-    wl_shm_pool* pool = wl_shm_create_pool(impl_->shm, fd, static_cast<int32_t>(size));
-    wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, w, h,
-                                                  static_cast<int32_t>(stride),
-                                                  WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
-
-    wl_surface_attach(out->surface, buffer, 0, 0);
-    wl_surface_damage_buffer(out->surface, 0, 0, w, h);
-    wl_surface_commit(out->surface);
-    wl_display_flush(impl_->display);
-
-    // Retire previous buffer resources.
-    if (out->buffer)
-        wl_buffer_destroy(out->buffer);
-    if (out->poolData)
-        munmap(out->poolData, out->poolSize);
-    out->buffer = buffer;
-    out->poolData = data;
-    out->poolSize = size;
-    out->bufW = w;
-    out->bufH = h;
     return true;
 }
 
 void WaylandBackend::hideMonitor(const std::string& monitor) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     OutputInfo* out = findOutput(impl_.get(), monitor);
-    if (!out || !out->surface)
+    if (!out)
         return;
+    out->pending.reset(); // stay hidden across future configures
+    if (!out->surface || !out->mapped)
+        return; // already unmapped: no commit needed
     wl_surface_attach(out->surface, nullptr, 0, 0);
     wl_surface_commit(out->surface);
     wl_display_flush(impl_->display);
+    out->mapped = false;
 }
 
 bool WaylandBackend::running() const {
