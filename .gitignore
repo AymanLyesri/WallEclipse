@@ -1,0 +1,50 @@
+# Build outputs
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+walleclipse
+build.ninja
+.ninja_*
+
+# Generated Wayland protocol code
+src/protocol-*.c
+src/protocol-*.h
+build/generated/
+
+# Compile DB / IDE
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime wallpaper state (per-monitor files are machine-local, like ArchEclipse)
+# Keep the seed config/defaults.conf, ignore per-monitor copies + locks
+config/*/defaults.conf
+config/*/defaults.conf.lock
+config/current.conf
+*.lock
+
+# Daemon runtime
+*.sock
+/tmp/walleclipse*.log
+
+# Tests build artifacts
+tests/build/
+Testing/
+CTestTestfile.cmake
+DartConfiguration.tcl
+
+# Python caches (if any tooling)
+__pycache__/
+*.pyc
+
+
+docs/
