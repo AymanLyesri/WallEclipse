@@ -63,6 +63,10 @@ target_link_libraries(walleclipse_core PUBLIC
 add_executable(walleclipse src/main.cpp)
 target_link_libraries(walleclipse PRIVATE walleclipse_core)
 
+include(GNUInstallDirs)
+install(TARGETS walleclipse DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/walleclipse)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(test_configstore tests/test_configstore.cpp)
