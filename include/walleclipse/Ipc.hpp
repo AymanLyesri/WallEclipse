@@ -11,8 +11,7 @@
 //   LIST                      print "<monitor> <ws> <path>" lines
 //   QUIT                      stop the daemon (local user only)
 class Ipc {
-public:
-    struct Handlers {
+public:    struct Handlers {
         std::function<void(const std::string& path)> preload;
         std::function<bool(const std::string& mon, int ws, const std::string& path)> set;
         std::function<std::string()> current;
@@ -21,8 +20,8 @@ public:
     };
 
     static std::string socketPath();
-    // Blocking server loop. Returns after QUIT or fatal error.
-    static void serve(Handlers h);
+    // Blocking server loop. Returns after QUIT (true) or fatal error (false).
+    static bool serve(Handlers h);
     // One-shot client: send lines, return server reply.
     static std::string call(const std::string& payload);
 };

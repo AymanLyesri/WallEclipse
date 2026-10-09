@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -252,7 +253,9 @@ int main(int argc, char** argv) {
             return s.empty() ? std::string("\n") : s;
         };
         ih.quit = [&] { ipcRun = false; };
-        Ipc::serve(std::move(ih));
+        if (!Ipc::serve(std::move(ih)))
+            logLine("ipc", "serve failed (socket " + Ipc::socketPath() + "): " +
+                                std::strerror(errno));
     });
     ipcThread.detach();
 

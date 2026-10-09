@@ -58,23 +58,23 @@ bool parseSet(const std::string& line, std::string& mon, int& ws, std::string& p
 
 } // namespace
 
-void Ipc::serve(Handlers h) {
+bool Ipc::serve(Handlers h) {
     std::string spath = socketPath();
     ::unlink(spath.c_str());
 
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0)
-        return;
+        return false;
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::strncpy(addr.sun_path, spath.c_str(), sizeof(addr.sun_path) - 1);
     if (bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         close(srv);
-        return;
+        return false;
     }
     if (listen(srv, 8) < 0) {
         close(srv);
-        return;
+        return false;
     }
 
     bool stop = false;
@@ -127,6 +127,7 @@ void Ipc::serve(Handlers h) {
     }
     close(srv);
     ::unlink(spath.c_str());
+    return true;
 }
 
 std::string Ipc::call(const std::string& payload) {
