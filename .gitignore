@@ -8,7 +8,8 @@ Makefile
 *.o
 *.a
 *.so
-walleclipse
+# Built binary (root-anchored: bare `walleclipse` would also ignore include/walleclipse/)
+/walleclipse
 build.ninja
 .ninja_*
 
