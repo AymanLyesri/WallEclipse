@@ -98,3 +98,27 @@ std::unique_ptr<TransitionEffect> makeTransition(const std::string& name) {
         return std::make_unique<NoneTransition>();
     return nullptr;
 }
+
+const std::vector<uint8_t>*
+ScaledCache::find(const std::shared_ptr<const DecodedImage>& src, int w, int h) const {
+    for (auto& e : entries_) {
+        if (e.src == src && e.w == w && e.h == h)
+            return &e.argb;
+    }
+    return nullptr;
+}
+
+void ScaledCache::store(std::shared_ptr<const DecodedImage> src, int w, int h,
+                        std::vector<uint8_t> argb) {
+    if (entries_.size() >= kMax)
+        entries_.clear();
+    entries_.push_back(Entry{std::move(src), w, h, std::move(argb)});
+}
+
+void ScaledCache::clear() {
+    entries_.clear();
+}
+
+size_t ScaledCache::size() const {
+    return entries_.size();
+}

@@ -60,6 +60,9 @@ struct OutputInfo {
 
     // Last presented frame (ARGB8888, bufW x bufH) for transitions.
     std::vector<uint8_t> lastFrame;
+    // Cover-fit results per (source, output size): scaling costs ~90ms at
+    // 1080p, paid once here instead of on every switch.
+    ScaledCache scaled;
     // Bumps on every setWallpaper; animation loops abort when stale.
     uint64_t generation = 0;
 };
@@ -322,7 +325,14 @@ void attachLocked(OutputInfo* out) {
         h = 1080;
     }
 
+    // Configure path: cache is usually warm (startup precache + switch path
+    // stores). Inline scale on miss only — rare, keeps this simple.
+    if (const auto* hit = out->scaled.find(out->pending, w, h)) {
+        attachPixelsLocked(out, *hit, w, h);
+        return;
+    }
     auto argb = scaleCoverArgb(*out->pending, w, h);
+    out->scaled.store(out->pending, w, h, argb);
     attachPixelsLocked(out, argb, w, h);
 }
 
@@ -472,7 +482,22 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
         transName = impl_->transitionName;
     }
 
-    auto newArgb = scaleCoverArgb(*img, w, h);
+    // Cover-fit, cached per (source, size): ~90ms on miss, ~0 on hit.
+    // Lookup under lock, scale outside it (never block the dispatch thread).
+    std::vector<uint8_t> newArgb;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (OutputInfo* out = findOutput(impl_.get(), monitor))
+            if (const auto* hit = out->scaled.find(img, w, h))
+                newArgb = *hit;
+    }
+    if (newArgb.empty()) {
+        newArgb = scaleCoverArgb(*img, w, h);
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (OutputInfo* out = findOutput(impl_.get(), monitor))
+            if (!out->scaled.find(img, w, h))
+                out->scaled.store(img, w, h, newArgb);
+    }
 
     auto isCurrent = [&] {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -539,8 +564,33 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
     return true;
 }
 
-void WaylandBackend::setTransition(const std::string& name) {
-    if (!makeTransition(name))
+void WaylandBackend::precache(const std::string& monitor,
+                              std::shared_ptr<const DecodedImage> img) {
+    if (!img || img->width <= 0 || img->height <= 0)
+        return;
+    int w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        if (!out)
+            return;
+        w = out->cfgW > 0 ? out->cfgW : out->width;
+        h = out->cfgH > 0 ? out->cfgH : out->height;
+        if (w <= 0 || h <= 0) {
+            w = 1920;
+            h = 1080;
+        }
+        if (out->scaled.find(img, w, h))
+            return;
+    }
+    auto argb = scaleCoverArgb(*img, w, h);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (OutputInfo* out = findOutput(impl_.get(), monitor))
+        if (!out->scaled.find(img, w, h))
+            out->scaled.store(img, w, h, std::move(argb));
+}
+
+void WaylandBackend::setTransition(const std::string& name) {    if (!makeTransition(name))
         return;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->transitionName = name;

@@ -47,6 +47,11 @@ public:
     void setTransition(const std::string& name);
     std::string transition() const;
 
+    // Scale + cache a wallpaper for a monitor without showing it. Warms the
+    // cover-fit cache at startup so the first visit to any workspace slides
+    // instantly instead of paying ~90ms mid-switch.
+    void precache(const std::string& monitor, std::shared_ptr<const DecodedImage> img);
+
     // Unmap the layer surface (used when mpvpaper takes over audio/video).
     void hideMonitor(const std::string& monitor);
 

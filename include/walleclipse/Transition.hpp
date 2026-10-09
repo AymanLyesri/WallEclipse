@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "walleclipse/ImageLoader.hpp"
+
 // Wallpaper transition effects. Open for future effects via makeTransition().
 // Sliding direction derives from workspace order: higher workspace id =
 // Forward (new wallpaper enters from the right), lower = Backward.
@@ -35,3 +37,29 @@ public:
 // Factory: "slide" (directional), "none" (instant cut).
 // Returns nullptr for unknown names. Add future effects here.
 std::unique_ptr<TransitionEffect> makeTransition(const std::string& name);
+
+// Cover-fit result cache: scaling a multi-megapixel source costs ~90ms at
+// 1080p, so scale once per (source, output size) and reuse on every switch.
+// Keyed by shared_ptr identity (never dereferenced: no lifetime risk).
+// Not thread-safe; the owner holds its own lock. Caps at kMax entries, then
+// drops everything (configs have ~10 slots, so the cap is never hit in
+// practice — it only bounds pathological IPC `set` spam).
+class ScaledCache {
+public:
+    static constexpr size_t kMax = 12;
+
+    const std::vector<uint8_t>* find(const std::shared_ptr<const DecodedImage>& src, int w,
+                                     int h) const;
+    void store(std::shared_ptr<const DecodedImage> src, int w, int h,
+               std::vector<uint8_t> argb);
+    void clear();
+    size_t size() const;
+
+private:
+    struct Entry {
+        std::shared_ptr<const DecodedImage> src;
+        int w = 0, h = 0;
+        std::vector<uint8_t> argb;
+    };
+    std::vector<Entry> entries_;
+};

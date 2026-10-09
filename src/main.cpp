@@ -169,6 +169,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Warm the cover-fit cache: the ~90ms scale per wallpaper happens here,
+    // once, instead of on the first visit to each workspace.
+    for (const auto& mon : monitors)
+        for (const auto& [ws, path] : store.wallpapersFor(mon)) {
+            (void)ws;
+            if (isMediaWallpaper(path))
+                continue;
+            if (auto img = preloader.get(path))
+                backend.precache(mon, img);
+        }
+
     std::string currentConf = store.baseDir() + "/current.conf";
     auto writeCurrentConf = [&](const std::string& path) {
         std::string expanded;
@@ -190,12 +201,7 @@ int main(int argc, char** argv) {
         return true;
     };
     handlers.showStatic = [&](const std::string& mon, const std::string& path, SlideDir dir,
-                                int fromWs, int toWs) {
-        logLine("slide", mon + " ws " + std::to_string(fromWs) + "->" + std::to_string(toWs) +
-                             " dir=" + (dir == SlideDir::Forward    ? "forward"
-                                        : dir == SlideDir::Backward ? "backward"
-                                                                   : "none") +
-                             " " + path);
+                                int, int) {
         // Animated slipped into a static slot? Delegate (never render garbage).
         if (isMediaWallpaper(path)) {
             backend.hideMonitor(mon);

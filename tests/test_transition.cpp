@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "walleclipse/Transition.hpp"
+#include "walleclipse/ImageLoader.hpp"
 
 static int failures = 0;
 #define CHECK(cond)                                             \
@@ -90,6 +91,26 @@ int main() {
     // None direction = instant cut to new.
     auto fNone = slide->render(oldF, newF, w, h, 0.5, SlideDir::None);
     CHECK(fNone == newF);
+
+    // ScaledCache: cover-fit results cached per (source, size), no compositor.
+    {
+        ScaledCache cache;
+        auto src = std::make_shared<DecodedImage>();
+        src->width = 2;
+        src->height = 1;
+        src->rgba = {255, 0, 0, 255, 0, 255, 0, 255};
+        CHECK(cache.find(src, 4, 4) == nullptr); // cold miss
+        auto argb = scaleCoverArgb(*src, 4, 4);
+        cache.store(src, 4, 4, argb);
+        auto hit = cache.find(src, 4, 4);
+        CHECK(hit != nullptr && *hit == argb);
+        CHECK(cache.find(src, 8, 8) == nullptr); // size mismatch = miss
+        auto other = std::make_shared<DecodedImage>(*src);
+        CHECK(cache.find(other, 4, 4) == nullptr); // different source = miss
+        CHECK(cache.size() == 1);
+        cache.clear();
+        CHECK(cache.size() == 0 && cache.find(src, 4, 4) == nullptr);
+    }
 
     if (failures == 0)
         std::cout << "test_transition: all passed\n";
