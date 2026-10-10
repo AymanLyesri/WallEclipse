@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -89,7 +90,16 @@ HyprListener::decide(const std::optional<std::string>& shown,
 
 void HyprListener::handleRefresh() {
     std::string text = execCapture("hyprctl monitors -j | jq -r '.[] | \"\\(.name) \\(.activeWorkspace.id)\"'");
-    for (auto& [monitor, ws] : parseSnapshotLines(text)) {
+    auto pairs = parseSnapshotLines(text);
+    if (pairs.empty()) {
+        // Compositor busy mid-resume: keep previous state, don't wipe it.
+        if (h_.onInfo)
+            h_.onInfo("change_wallpaper", "empty monitor snapshot; keeping previous");
+        return;
+    }
+    std::set<std::string> seen;
+    for (auto& [monitor, ws] : pairs) {
+        seen.insert(monitor);
         auto lw = lastWorkspace_.find(monitor);
         if (lw != lastWorkspace_.end() && lw->second == ws)
             continue; // unchanged workspace
@@ -140,6 +150,17 @@ void HyprListener::handleRefresh() {
             break;
         }
         lastWorkspace_[monitor] = ws;
+    }
+    // Prune disconnected monitors so a reconnect forces a repaint
+    // instead of being skipped as "unchanged workspace".
+    for (auto it = lastWorkspace_.begin(); it != lastWorkspace_.end();) {
+        if (seen.find(it->first) == seen.end()) {
+            currentWallpaper_.erase(it->first);
+            lastStaticWallpaper_.erase(it->first);
+            it = lastWorkspace_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
