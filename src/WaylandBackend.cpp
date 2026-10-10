@@ -153,6 +153,12 @@ void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
         out->buffer = nullptr;
     }
     destroyPoolsLocked(out);
+    // Visible in [wayland] logs so the next blank-screen report shows
+    // whether the compositor closed us (sleep/DPMS/reload) and we are
+    // waiting on a repaint. pending survives: the next configure or
+    // setWallpaper re-attaches it.
+    if (out->impl)
+        out->impl->vlog("layer surface closed, will repaint on next setWallpaper/configure");
 }
 
 const zwlr_layer_surface_v1_listener kLayerListener = {layerConfigure, layerClosed};
@@ -221,9 +227,13 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
     }
 }
 
-void registryRemove(void* data, wl_registry*, uint32_t) {
-    (void)data;
+void registryRemove(void* data, wl_registry*, uint32_t name) {
     // Hotplug-removal destroys surfaces lazily on next setWallpaper/hide.
+    // Logged so sleep/disconnect cycles are visible in [wayland] logs.
+    auto* self = static_cast<WaylandBackend::Impl*>(data);
+    if (self)
+        self->vlog("output global " + std::to_string(name) +
+                   " removed (hotplug/sleep?)");
 }
 
 const wl_registry_listener kRegistryListener = {registryGlobal, registryRemove};
