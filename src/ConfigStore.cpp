@@ -1,11 +1,10 @@
 #include "walleclipse/ConfigStore.hpp"
+#include "walleclipse/Util.hpp"
 
+#include <algorithm>
 #include <cstdlib>
-#include <cstring>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -24,30 +23,11 @@ ConfigStore ConfigStore::defaultLocation() {
 }
 
 void ConfigStore::expandPath(const std::string& in, std::string& out) {
-    const char* home = std::getenv("HOME");
-    std::string h = home ? home : "";
-    if (!in.empty() && in[0] == '~') {
-        out = h + in.substr(1);
-    } else if (in.rfind("$HOME", 0) == 0) {
-        out = h + in.substr(5);
-    } else {
-        out = in;
-    }
+    out = expandHome(in);
 }
 
 std::string ConfigStore::monitorConf(const std::string& monitor) const {
     return baseDir_ + "/" + monitor + "/defaults.conf";
-}
-
-static bool copyFile(const std::string& src, const std::string& dst) {
-    std::ifstream in(src, std::ios::binary);
-    if (!in)
-        return false;
-    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
-    if (!out)
-        return false;
-    out << in.rdbuf();
-    return static_cast<bool>(out);
 }
 
 void ConfigStore::ensureMonitors(const std::vector<std::string>& monitors) {
@@ -57,13 +37,13 @@ void ConfigStore::ensureMonitors(const std::vector<std::string>& monitors) {
     for (const auto& mon : monitors) {
         if (mon.empty())
             continue;
-        std::string dir = baseDir_ + "/" + mon;
-        fs::create_directories(dir, ec);
-        std::string conf = dir + "/defaults.conf";
-        bool needsInit = !fs::exists(conf, ec) || fs::file_size(conf, ec) == 0;
-        if (needsInit && fs::exists(seed, ec))
-            copyFile(seed, conf);
-        else if (needsInit) {
+        std::string conf = baseDir_ + "/" + mon + "/defaults.conf";
+        fs::create_directories(fs::path(conf).parent_path(), ec);
+        if (fs::exists(conf, ec) && fs::file_size(conf, ec) != 0)
+            continue;
+        if (fs::exists(seed, ec))
+            fs::copy_file(seed, conf, fs::copy_options::overwrite_existing, ec);
+        else {
             // No seed: write empty w-1..w-10 template (matches ArchEclipse seed shape).
             std::ofstream out(conf, std::ios::trunc);
             for (int i = 1; i <= 10; ++i)
@@ -84,26 +64,34 @@ std::vector<std::string> ConfigStore::monitors() const {
     return out;
 }
 
+namespace {
+bool parseWallpaperLine(std::string line, int& ws, std::string& path) {
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+    if (line.rfind("w-", 0) != 0)
+        return false;
+    auto eq = line.find('=');
+    if (eq == std::string::npos)
+        return false;
+    try {
+        ws = std::stoi(line.substr(2, eq - 2));
+    } catch (...) {
+        return false;
+    }
+    path = line.substr(eq + 1);
+    return true;
+}
+} // namespace
+
 std::map<int, std::string> ConfigStore::wallpapersFor(const std::string& monitor) const {
     std::map<int, std::string> out;
     std::ifstream fp(monitorConf(monitor));
-    if (!fp)
-        return out;
     std::string line;
-    while (std::getline(fp, line)) {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.rfind("w-", 0) != 0)
-            continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos)
-            continue;
-        try {
-            int ws = std::stoi(line.substr(2, eq - 2));
-            out[ws] = line.substr(eq + 1);
-        } catch (...) {
-        }
-    }
+    int ws = 0;
+    std::string path;
+    while (std::getline(fp, line))
+        if (parseWallpaperLine(line, ws, path))
+            out[ws] = path;
     return out;
 }
 
@@ -122,20 +110,17 @@ bool ConfigStore::setWallpaper(const std::string& monitor, int workspace,
     std::error_code ec;
     fs::create_directories(fs::path(conf).parent_path(), ec);
 
-    std::string lockPath = conf + ".lock";
-    int lockFd = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0644);
-    if (lockFd < 0)
-        return false;
-    if (flock(lockFd, LOCK_EX) != 0) {
-        ::close(lockFd);
+    int lockFd = ::open((conf + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (lockFd < 0 || flock(lockFd, LOCK_EX) != 0) {
+        if (lockFd >= 0)
+            ::close(lockFd);
         return false;
     }
 
-    // Read all lines (may not exist yet).
     std::vector<std::string> lines;
-    {
+    std::string line;
+    { // Read all lines (may not exist yet).
         std::ifstream fp(conf);
-        std::string line;
         while (std::getline(fp, line)) {
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
@@ -143,27 +128,20 @@ bool ConfigStore::setWallpaper(const std::string& monitor, int workspace,
         }
     }
 
-    std::string key = "w-" + std::to_string(workspace) + "=";
-    std::string replacement = key + path;
-    bool found = false;
-    for (auto& line : lines) {
-        if (line.rfind(key, 0) == 0) {
-            line = replacement;
-            found = true;
-            break;
-        }
-    }
-    if (!found)
+    std::string replacement = "w-" + std::to_string(workspace) + "=" + path;
+    auto it = std::find_if(lines.begin(), lines.end(), [&](const std::string& l) {
+        return l.rfind(replacement.substr(0, replacement.find('=') + 1), 0) == 0;
+    });
+    if (it != lines.end())
+        *it = replacement;
+    else
         lines.push_back(replacement);
 
     bool ok = false;
-    {
-        std::ofstream fp(conf, std::ios::trunc);
-        if (fp) {
-            for (const auto& line : lines)
-                fp << line << "\n";
-            ok = static_cast<bool>(fp);
-        }
+    if (std::ofstream fp(conf, std::ios::trunc); fp) {
+        for (const auto& l : lines)
+            fp << l << "\n";
+        ok = static_cast<bool>(fp);
     }
 
     flock(lockFd, LOCK_UN);

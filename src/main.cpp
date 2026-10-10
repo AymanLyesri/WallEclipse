@@ -20,6 +20,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "walleclipse/ConfigStore.hpp"
@@ -28,6 +29,7 @@
 #include "walleclipse/Ipc.hpp"
 #include "walleclipse/MediaDelegate.hpp"
 #include "walleclipse/Preloader.hpp"
+#include "walleclipse/Util.hpp"
 #include "walleclipse/VideoPoster.hpp"
 #include "walleclipse/WaylandBackend.hpp"
 
@@ -58,21 +60,27 @@ void printHelp(const char* argv0) {
 std::vector<std::string> queryMonitors() {
     // One hyprctl snapshot per call (no N+1), same as wallpaper-loop.c.
     std::vector<std::string> out;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(
-        popen("hyprctl monitors -j | jq -r '.[].name'", "r"), pclose);
-    if (!pipe)
-        return out;
-    char* line = nullptr;
-    size_t cap = 0;
-    while (getline(&line, &cap, pipe.get()) > 0) {
-        std::string s(line);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
-            s.pop_back();
-        if (!s.empty())
-            out.push_back(s);
+    for (auto l : splitLines(execCapture("hyprctl monitors -j | jq -r '.[].name'"))) {
+        l = trimWs(l);
+        if (!l.empty())
+            out.push_back(l);
     }
-    free(line);
     return out;
+}
+
+std::optional<DecodedImage> resolveImage(const std::string& path) {
+    std::string expanded = expandHome(path);
+    if (auto img = loadImage(expanded.empty() ? path : expanded))
+        return img;
+    if (!expanded.empty() && expanded != path)
+        return loadImage(path);
+    return std::nullopt;
+}
+
+int runClient(const std::string& req) {
+    std::string reply = Ipc::call(req);
+    std::cout << reply;
+    return reply.rfind("ERR", 0) == 0 ? 1 : 0;
 }
 
 } // namespace
@@ -84,26 +92,19 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: walleclipse set <monitor> <workspace> <path>\n";
             return 2;
         }
-        std::string req = "SET " + std::string(argv[2]) + " " + argv[3] + " " + argv[4];
-        std::string reply = Ipc::call(req);
-        std::cout << reply;
-        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
+        return runClient("SET " + std::string(argv[2]) + " " + argv[3] + " " + argv[4]);
     }
     if (argc >= 2 && std::strcmp(argv[1], "preload") == 0) {
         if (argc < 3) {
             std::cerr << "Usage: walleclipse preload <path>\n";
             return 2;
         }
-        std::string reply = Ipc::call("PRELOAD " + std::string(argv[2]));
-        std::cout << reply;
-        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
+        return runClient("PRELOAD " + std::string(argv[2]));
     }
     if (argc >= 2 &&
         (std::strcmp(argv[1], "current") == 0 || std::strcmp(argv[1], "list") == 0 ||
          std::strcmp(argv[1], "reload") == 0)) {
-        std::string reply = Ipc::call(argv[1]);
-        std::cout << reply;
-        return reply.rfind("ERR", 0) == 0 ? 1 : 0;
+        return runClient(argv[1]);
     }
     if (argc >= 2 &&
         (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
@@ -121,11 +122,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         std::string mon = argv[2], path = argv[3];
-        std::string expanded;
-        ConfigStore::expandPath(path, expanded);
-        auto img = loadImage(expanded);
-        if (!img)
-            img = loadImage(path);
+        auto img = resolveImage(path);
         if (!img) {
             std::cerr << "cannot decode " << path << "\n";
             return 1;
@@ -189,8 +186,7 @@ int main(int argc, char** argv) {
 
     std::string currentConf = store.baseDir() + "/current.conf";
     auto writeCurrentConf = [&](const std::string& path) {
-        std::string expanded;
-        ConfigStore::expandPath(path, expanded);
+        std::string expanded = expandHome(path);
         if (FILE* fp = std::fopen(currentConf.c_str(), "w")) {
             std::fputs((expanded.empty() ? path : expanded).c_str(), fp);
             std::fputc('\n', fp);
@@ -236,77 +232,84 @@ int main(int argc, char** argv) {
     // layer surface appears (plus a beat for its first frame) and only
     // then is hidden. Works regardless of surface stacking order.
     auto handoffToVideo = [&](const std::string& mon, const std::string& path) {
-        std::string expanded;
-        ConfigStore::expandPath(path, expanded);
+        std::string expanded = expandHome(path);
         MediaDelegate::playOnMonitor(mon, expanded.empty() ? path : expanded);
         if (!MediaDelegate::waitForPlayer(mon))
             logLine("change_wallpaper", "mpvpaper slow on '" + mon +
                                             "' — hid poster before first frame");
         backend.hideMonitor(mon);
     };
-    handlers.showStatic = [&](const std::string& mon, const std::string& path, SlideDir dir,
-                                int, int) {
+    auto trackShown = [&](const std::string& mon, const std::string& path,
+                        HyprListener* l = nullptr) {
+        if (l)
+            l->noteShown(mon, path);
+        setShown(mon, path);
+        writeCurrentConf(path);
+        MediaDelegate::applyTheme(path);
+    };
+    auto showStaticNow = [&](const std::string& mon, const std::string& path,
+                             SlideDir dir) -> bool {
         // Animated slipped into a static slot? Delegate (never render garbage).
         if (isMediaWallpaper(path)) {
             handoffToVideo(mon, path);
-            MediaDelegate::applyTheme(path);
-            setShown(mon, path);
-            return;
+            trackShown(mon, path);
+            return true;
         }
         auto img = preloader.get(path);
-        if (!img) { // cache miss (SET during runtime): decode on demand, then cache
+        if (!img) { // cache miss (SET during runtime): decode on demand
             preloader.preloadOne(path);
             img = preloader.get(path);
         }
         if (!img) {
             logLine("change_wallpaper", "cannot decode '" + path + "' — keeping previous");
-            return;
+            return false;
         }
         if (!backend.isMapped(mon)) {
             // Coming from video: restore its poster under mpvpaper first
             // (invisible), so killing the player reveals the poster and
             // the slide starts there instead of cutting from black.
             std::string prev = getShown(mon);
-            if (isMediaWallpaper(prev)) {
+            if (isMediaWallpaper(prev))
                 if (auto poster = posterFor(prev))
                     backend.remapWithImage(mon, poster);
-            }
         }
         MediaDelegate::stopForMonitor(mon); // leaving video -> kill mpvpaper first
         if (!backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img), dir))
             logLine("change_wallpaper", "unknown monitor '" + mon + "'");
-        setShown(mon, path);
-        writeCurrentConf(path);
-        std::thread([path] { MediaDelegate::applyTheme(path); }).detach();
+        trackShown(mon, path);
+        return true;
     };
-    handlers.showAnimated = [&](const std::string& mon, const std::string& path,
-                                SlideDir dir, int, int) {
+    auto showAnimatedNow = [&](const std::string& mon, const std::string& path,
+                               SlideDir dir) -> bool {
         if (backend.isMapped(mon)) {
-            // Static -> animated: slide the old frame out to the video's
-            // poster while still mapped, then hand off to mpvpaper.
+            // Static -> animated: slide to the video's poster, then hand off.
             if (auto poster = posterFor(path))
                 backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(poster),
                                      dir);
-        } else {
-            // Animated -> animated: reveal the old poster under the
-            // player, slide poster -> poster, then hand off.
-            std::string prev = getShown(mon);
-            if (isMediaWallpaper(prev)) {
-                auto oldPoster = posterFor(prev);
-                auto newPoster = posterFor(path);
-                if (oldPoster && newPoster &&
-                    backend.remapWithImage(mon, oldPoster)) {
-                    MediaDelegate::stopForMonitor(mon); // reveal old poster
-                    backend.setWallpaper(
-                        mon, std::shared_ptr<const DecodedImage>(newPoster), dir);
-                }
+        } else if (std::string prev = getShown(mon); isMediaWallpaper(prev)) {
+            // Animated -> animated: reveal old poster, slide poster->poster.
+            auto oldPoster = posterFor(prev);
+            auto newPoster = posterFor(path);
+            if (oldPoster && newPoster && backend.remapWithImage(mon, oldPoster)) {
+                MediaDelegate::stopForMonitor(mon); // reveal old poster
+                backend.setWallpaper(mon,
+                                     std::shared_ptr<const DecodedImage>(newPoster), dir);
             }
         }
         handoffToVideo(mon, path);
-        setShown(mon, path);
-        writeCurrentConf(path);
-        MediaDelegate::applyTheme(path);
+        trackShown(mon, path);
+        return true;
     };
+    handlers.showStatic = [&](const std::string& mon, const std::string& path,
+                              SlideDir dir, int, int) {
+        if (isMediaWallpaper(path))
+            showAnimatedNow(mon, path, dir);
+        else
+            showStaticNow(mon, path, dir);
+        // Keep listener state accurate (handlers run inside listener flow).
+    };
+    handlers.showAnimated = [&](const std::string& mon, const std::string& path,
+                                SlideDir dir, int, int) { showAnimatedNow(mon, path, dir); };
     handlers.onError = [](const std::string& w, const std::string& m) { logLine(w, m); };
     handlers.onInfo = [](const std::string& w, const std::string& m) { logLine(w, m); };
 
@@ -330,31 +333,21 @@ int main(int argc, char** argv) {
         ih.set = [&](const std::string& mon, int ws, const std::string& path) {
             if (!store.setWallpaper(mon, ws, path))
                 return false;
-            std::string out = path;
-            if (isMediaWallpaper(out)) {
-                // No slide out-of-band, but keep the current frame up
-                // until the player is ready (same no-blank handoff).
-                // Poster warmed so the next switch slides.
-                preloader.preloadPosterOne(out);
-                handoffToVideo(mon, out);
-                if (activeListener)
-                    activeListener->noteShown(mon, out);
-                setShown(mon, out);
-                writeCurrentConf(out);
-            } else {
-                preloader.preloadOne(out);
-                auto img = preloader.get(out);
-                if (img) {
-                    MediaDelegate::stopForMonitor(mon);
-                    backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img));
-                    if (activeListener)
-                        activeListener->noteShown(mon, out);
-                    setShown(mon, out);
-                    writeCurrentConf(out);
-                }
-            }
-            MediaDelegate::applyTheme(out);
-            return true;
+            // No slide out-of-band; reuse the same show path with None dir.
+            // Warm the cache first so the next switch slides.
+            if (isMediaWallpaper(path))
+                preloader.preloadPosterOne(path);
+            else
+                preloader.preloadOne(path);
+            // Publish via listener state, then render without duplicating logic.
+            // Note: showStaticNow/showAnimatedNow already track + theme.
+            // Temporarily expose listener for trackShown.
+            bool ok = isMediaWallpaper(path)
+                            ? showAnimatedNow(mon, path, SlideDir::None)
+                            : showStaticNow(mon, path, SlideDir::None);
+            if (ok && activeListener)
+                activeListener->noteShown(mon, path);
+            return ok;
         };
         ih.current = [&] {
             std::ifstream fp(currentConf);

@@ -96,6 +96,8 @@ void attachPixelsLocked(OutputInfo* out, const std::vector<uint8_t>& argb, int w
 // (Re)create the layer surface + initial empty commit. True when a layer
 // surface exists afterwards (buffer still waits for configure).
 bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out);
+static OutputInfo* findOutput(WaylandBackend::Impl* impl, const std::string& monitor);
+static void outSize(OutputInfo* out, int& w, int& h);
 
 void layerConfigure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial,
                      uint32_t width, uint32_t height) {
@@ -328,12 +330,8 @@ void attachLocked(OutputInfo* out) {
         !out->impl || !out->impl->shm || !out->impl->display)
         return;
 
-    int w = out->cfgW > 0 ? out->cfgW : out->width;
-    int h = out->cfgH > 0 ? out->cfgH : out->height;
-    if (w <= 0 || h <= 0) {
-        w = 1920;
-        h = 1080;
-    }
+    int w = 0, h = 0;
+    outSize(out, w, h);
 
     // Configure path: cache is usually warm (startup precache + switch path
     // stores). Inline scale on miss only — rare, keeps this simple.
@@ -375,6 +373,46 @@ bool ensureSurfaceLocked(WaylandBackend::Impl* impl, OutputInfo* out) {
     // only then may a buffer be attached.
     wl_surface_commit(out->surface);
     return true;
+}
+
+
+static OutputInfo* findOutput(WaylandBackend::Impl* impl, const std::string& monitor) {
+    for (auto& [wlOut, info] : impl->outputs)
+        if (info->name == monitor)
+            return info.get();
+    return nullptr;
+}
+
+static void outSize(OutputInfo* out, int& w, int& h) {
+    w = out->cfgW > 0 ? out->cfgW : out->width;
+    h = out->cfgH > 0 ? out->cfgH : out->height;
+    if (w <= 0 || h <= 0) {
+        w = 1920;
+        h = 1080;
+    }
+}
+
+// Cover-fit cached per (source, size). Lookup under lock, scale outside it.
+static std::vector<uint8_t> coverCached(WaylandBackend::Impl* impl,
+                                        const std::string& monitor,
+                                        std::shared_ptr<const DecodedImage> img,
+                                        int w, int h) {
+    {
+        std::lock_guard<std::mutex> lock(impl->mutex);
+        if (OutputInfo* out = findOutput(impl, monitor))
+            if (const auto* hit = out->scaled.find(img, w, h))
+                return *hit;
+    }
+    auto argb = scaleCoverArgb(*img, w, h);
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (OutputInfo* out = findOutput(impl, monitor))
+        if (!out->scaled.find(img, w, h))
+            out->scaled.store(img, w, h, argb);
+    return argb;
+}
+
+static bool validImg(const std::shared_ptr<const DecodedImage>& img) {
+    return img && img->width > 0 && img->height > 0;
 }
 
 } // namespace
@@ -442,14 +480,6 @@ std::vector<std::string> WaylandBackend::outputs() {
     return names;
 }
 
-static OutputInfo* findOutput(WaylandBackend::Impl* impl, const std::string& monitor) {
-    for (auto& [wlOut, info] : impl->outputs) {
-        if (info->name == monitor)
-            return info.get();
-    }
-    return nullptr;
-}
-
 bool WaylandBackend::setWallpaper(const std::string& monitor, const DecodedImage& img) {
     return setWallpaper(monitor, std::make_shared<DecodedImage>(img), SlideDir::None);
 }
@@ -462,7 +492,7 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
 bool WaylandBackend::setWallpaper(const std::string& monitor,
                                   std::shared_ptr<const DecodedImage> img,
                                   SlideDir dir) {
-    if (!img || img->width <= 0 || img->height <= 0)
+    if (!validImg(img))
         return false;
 
     int w = 0, h = 0;
@@ -473,41 +503,18 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         OutputInfo* out = findOutput(impl_.get(), monitor);
-        if (!out)
-            return false;
-        if (!ensureSurfaceLocked(impl_.get(), out))
+        if (!out || !ensureSurfaceLocked(impl_.get(), out))
             return false;
         out->pending = img;
-        ++out->generation;
-        myGen = out->generation;
+        myGen = ++out->generation;
         wasConfigured = out->configured;
         wasMapped = out->mapped;
-        w = out->cfgW > 0 ? out->cfgW : out->width;
-        h = out->cfgH > 0 ? out->cfgH : out->height;
-        if (w <= 0 || h <= 0) {
-            w = 1920;
-            h = 1080;
-        }
+        outSize(out, w, h);
         oldFrame = out->lastFrame;
         transName = impl_->transitionName;
     }
 
-    // Cover-fit, cached per (source, size): ~90ms on miss, ~0 on hit.
-    // Lookup under lock, scale outside it (never block the dispatch thread).
-    std::vector<uint8_t> newArgb;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (OutputInfo* out = findOutput(impl_.get(), monitor))
-            if (const auto* hit = out->scaled.find(img, w, h))
-                newArgb = *hit;
-    }
-    if (newArgb.empty()) {
-        newArgb = scaleCoverArgb(*img, w, h);
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (OutputInfo* out = findOutput(impl_.get(), monitor))
-            if (!out->scaled.find(img, w, h))
-                out->scaled.store(img, w, h, newArgb);
-    }
+    std::vector<uint8_t> newArgb = coverCached(impl_.get(), monitor, img, w, h);
 
     auto isCurrent = [&] {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -576,7 +583,7 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
 
 void WaylandBackend::precache(const std::string& monitor,
                               std::shared_ptr<const DecodedImage> img) {
-    if (!img || img->width <= 0 || img->height <= 0)
+    if (!validImg(img))
         return;
     int w = 0, h = 0;
     {
@@ -584,23 +591,15 @@ void WaylandBackend::precache(const std::string& monitor,
         OutputInfo* out = findOutput(impl_.get(), monitor);
         if (!out)
             return;
-        w = out->cfgW > 0 ? out->cfgW : out->width;
-        h = out->cfgH > 0 ? out->cfgH : out->height;
-        if (w <= 0 || h <= 0) {
-            w = 1920;
-            h = 1080;
-        }
+        outSize(out, w, h);
         if (out->scaled.find(img, w, h))
             return;
     }
-    auto argb = scaleCoverArgb(*img, w, h);
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (OutputInfo* out = findOutput(impl_.get(), monitor))
-        if (!out->scaled.find(img, w, h))
-            out->scaled.store(img, w, h, std::move(argb));
+    coverCached(impl_.get(), monitor, img, w, h);
 }
 
-void WaylandBackend::setTransition(const std::string& name) {    if (!makeTransition(name))
+void WaylandBackend::setTransition(const std::string& name) {
+    if (!makeTransition(name))
         return;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->transitionName = name;
@@ -620,7 +619,7 @@ bool WaylandBackend::isMapped(const std::string& monitor) const {
 bool WaylandBackend::remapWithImage(const std::string& monitor,
                                     std::shared_ptr<const DecodedImage> img,
                                     int timeoutMs) {
-    if (!img || img->width <= 0 || img->height <= 0)
+    if (!validImg(img))
         return false;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -666,6 +665,4 @@ void WaylandBackend::hideMonitor(const std::string& monitor) {
     out->mapped = false;
 }
 
-bool WaylandBackend::running() const {
-    return impl_->running;
-}
+bool WaylandBackend::running() const { return impl_->running; }

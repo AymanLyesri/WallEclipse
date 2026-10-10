@@ -17,16 +17,14 @@
 
 namespace {
 
-bool hasExt(const std::string& path, const char* ext) {
-    if (path.size() <= std::strlen(ext) + 1)
-        return false;
+std::string lowerExt(const std::string& path) {
     auto dot = path.find_last_of('.');
-    if (dot == std::string::npos)
-        return false;
+    if (dot == std::string::npos || dot + 2 >= path.size())
+        return "";
     std::string got = path.substr(dot + 1);
     std::transform(got.begin(), got.end(), got.begin(),
                    [](unsigned char c) { return std::tolower(c); });
-    return got == ext;
+    return got;
 }
 
 std::optional<std::vector<uint8_t>> readFile(const std::string& path) {
@@ -41,17 +39,20 @@ std::optional<std::vector<uint8_t>> readFile(const std::string& path) {
         return std::nullopt;
     }
     std::vector<uint8_t> data(static_cast<size_t>(size));
-    size_t n = std::fread(data.data(), 1, data.size(), fp);
+    bool ok = std::fread(data.data(), 1, data.size(), fp) == data.size();
     std::fclose(fp);
-    if (n != data.size())
+    if (!ok)
         return std::nullopt;
     return data;
 }
 
+bool validSize(int w, int h) { return w > 0 && h > 0 && w <= 16384 && h <= 16384; }
+
 } // namespace
 
 bool isMediaWallpaper(const std::string& path) {
-    return hasExt(path, "gif") || hasExt(path, "mp4") || hasExt(path, "webm");
+    auto e = lowerExt(path);
+    return e == "gif" || e == "mp4" || e == "webm";
 }
 
 std::optional<DecodedImage> loadImage(const std::string& path) {
@@ -59,35 +60,31 @@ std::optional<DecodedImage> loadImage(const std::string& path) {
     if (!file)
         return std::nullopt;
 
-    if (hasExt(path, "webp")) {
-        int w = 0, h = 0;
-        uint8_t* px = WebPDecodeRGBA(file->data(), file->size(), &w, &h);
-        if (!px || w <= 0 || h <= 0 || w > 16384 || h > 16384) {
-            if (px)
-                WebPFree(px);
-            return std::nullopt;
-        }
-        DecodedImage img;
-        img.width = w;
-        img.height = h;
-        img.rgba.assign(px, px + static_cast<size_t>(w) * h * 4);
-        WebPFree(px);
-        return img;
+    int w = 0, h = 0;
+    const uint8_t* px = nullptr;
+    bool webp = lowerExt(path) == "webp";
+    stbi_uc* stb = nullptr;
+    uint8_t* wp = nullptr;
+    if (webp)
+        wp = WebPDecodeRGBA(file->data(), file->size(), &w, &h);
+    else {
+        int comp = 0;
+        stb = stbi_load_from_memory(file->data(), static_cast<int>(file->size()),
+                                    &w, &h, &comp, 4);
     }
-
-    int w = 0, h = 0, comp = 0;
-    stbi_uc* px = stbi_load_from_memory(file->data(), static_cast<int>(file->size()),
-                                        &w, &h, &comp, 4);
-    if (!px || w <= 0 || h <= 0 || w > 16384 || h > 16384) {
-        if (px)
-            stbi_image_free(px);
+    px = webp ? wp : stb;
+    if (!px || !validSize(w, h)) {
+        if (stb)
+            stbi_image_free(stb);
+        if (wp)
+            WebPFree(wp);
         return std::nullopt;
     }
-    DecodedImage img;
-    img.width = w;
-    img.height = h;
-    img.rgba.assign(px, px + static_cast<size_t>(w) * h * 4);
-    stbi_image_free(px);
+    DecodedImage img{w, h, {px, px + static_cast<size_t>(w) * h * 4}};
+    if (stb)
+        stbi_image_free(stb);
+    if (wp)
+        WebPFree(wp);
     return img;
 }
 

@@ -19,17 +19,11 @@ constexpr int kSlideDurationMs = 350;
 
 class SlidingTransition : public TransitionEffect {
 public:
-    int durationMs() const override {
-        return kSlideDurationMs;
-    }
+    int durationMs() const override { return kSlideDurationMs; }
     double eased(double t) const override {
         t = std::clamp(t, 0.0, 1.0);
         // easeOutCubic: 1-(1-t)^3. Fast start like Hyprland `ease`
         // bezier (0,1 -> 0.618,1), gentle landing. Endpoints exact.
-        if (t <= 0.0)
-            return 0.0;
-        if (t >= 1.0)
-            return 1.0;
         return 1.0 - std::pow(1.0 - t, 3.0);
     }
     std::vector<uint8_t> render(const std::vector<uint8_t>& oldFrame,
@@ -39,22 +33,15 @@ public:
             return newFrame;
         if (progress <= 0.0)
             return oldFrame;
-        double e = eased(progress);
-        if (e <= 0.0)
-            return oldFrame;
-        if (e >= 1.0)
-            return newFrame;
-        int split = static_cast<int>(e * w);
+        int split = static_cast<int>(eased(progress) * w);
         if (split <= 0)
             return oldFrame;
-        if (split >= w)
-            return newFrame;
-        std::vector<uint8_t> out(oldFrame.size());
-        if (oldFrame.size() != newFrame.size() ||
+        if (split >= w || oldFrame.size() != newFrame.size() ||
             oldFrame.size() != static_cast<size_t>(w) * h * 4)
             return newFrame;
         // Row-based composite: each row is one contiguous old run + one
         // contiguous new run (2 memcpys/row, not per-pixel).
+        std::vector<uint8_t> out(oldFrame.size());
         size_t rowBytes = static_cast<size_t>(w) * 4;
         size_t newBytes = static_cast<size_t>(split) * 4;
         size_t oldBytes = rowBytes - newBytes;
@@ -76,12 +63,8 @@ public:
 
 class NoneTransition : public TransitionEffect {
 public:
-    int durationMs() const override {
-        return 0;
-    }
-    double eased(double t) const override {
-        return std::clamp(t, 0.0, 1.0);
-    }
+    int durationMs() const override { return 0; }
+    double eased(double t) const override { return std::clamp(t, 0.0, 1.0); }
     std::vector<uint8_t> render(const std::vector<uint8_t>&,
                                 const std::vector<uint8_t>& newFrame, int, int,
                                 double, SlideDir) const override {
@@ -115,10 +98,6 @@ void ScaledCache::store(std::shared_ptr<const DecodedImage> src, int w, int h,
     entries_.push_back(Entry{std::move(src), w, h, std::move(argb)});
 }
 
-void ScaledCache::clear() {
-    entries_.clear();
-}
+void ScaledCache::clear() { entries_.clear(); }
 
-size_t ScaledCache::size() const {
-    return entries_.size();
-}
+size_t ScaledCache::size() const { return entries_.size(); }

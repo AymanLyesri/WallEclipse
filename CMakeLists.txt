@@ -53,6 +53,7 @@ add_library(walleclipse_core STATIC
   src/HyprListener.cpp
   src/MediaDelegate.cpp
   src/VideoPoster.cpp
+  src/Util.cpp
   src/Ipc.cpp)
 target_include_directories(walleclipse_core PUBLIC
   include ${CMAKE_CURRENT_SOURCE_DIR}/third_party ${GEN_DIR}
