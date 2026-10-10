@@ -47,6 +47,20 @@ public:
     void setTransition(const std::string& name);
     std::string transition() const;
 
+    // Whether the monitor's layer surface currently has a buffer attached.
+    // False after hideMonitor() (mpvpaper showing) or a compositor close.
+    bool isMapped(const std::string& monitor) const;
+
+    // Re-show the surface with a poster image after it was hidden,
+    // waiting (up to timeoutMs) for the compositor configure round-trip.
+    // Used to restore a visible frame under mpvpaper before sliding to
+    // the next wallpaper, so animated switches animate instead of cut.
+    // Returns false on unknown monitor or timeout (caller falls back to
+    // the instant path). No-op true when already mapped.
+    bool remapWithImage(const std::string& monitor,
+                        std::shared_ptr<const DecodedImage> img,
+                        int timeoutMs = 1000);
+
     // Scale + cache a wallpaper for a monitor without showing it. Warms the
     // cover-fit cache at startup so the first visit to any workspace slides
     // instantly instead of paying ~90ms mid-switch.

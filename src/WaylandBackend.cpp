@@ -611,6 +611,46 @@ std::string WaylandBackend::transition() const {
     return impl_->transitionName;
 }
 
+bool WaylandBackend::isMapped(const std::string& monitor) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    OutputInfo* out = findOutput(impl_.get(), monitor);
+    return out && out->mapped;
+}
+
+bool WaylandBackend::remapWithImage(const std::string& monitor,
+                                    std::shared_ptr<const DecodedImage> img,
+                                    int timeoutMs) {
+    if (!img || img->width <= 0 || img->height <= 0)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        OutputInfo* out = findOutput(impl_.get(), monitor);
+        if (!out)
+            return false;
+        if (out->mapped)
+            return true; // already visible: caller slides directly
+        if (!ensureSurfaceLocked(impl_.get(), out))
+            return false;
+        out->pending = std::move(img);
+        ++out->generation;
+        if (!out->surface)
+            return false;
+        // Empty commit asks the compositor to remap; the configure
+        // handler attaches pending (same mechanics as the instant path
+        // in setWallpaper). No buffer is attached here: after a nil
+        // attach the surface needs a fresh configure first.
+        wl_surface_commit(out->surface);
+        wl_display_flush(impl_->display);
+    }
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (isMapped(monitor))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return isMapped(monitor);
+}
+
 void WaylandBackend::hideMonitor(const std::string& monitor) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     OutputInfo* out = findOutput(impl_.get(), monitor);

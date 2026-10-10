@@ -52,6 +52,7 @@ add_library(walleclipse_core STATIC
   src/WaylandBackend.cpp
   src/HyprListener.cpp
   src/MediaDelegate.cpp
+  src/VideoPoster.cpp
   src/Ipc.cpp)
 target_include_directories(walleclipse_core PUBLIC
   include ${CMAKE_CURRENT_SOURCE_DIR}/third_party ${GEN_DIR}
@@ -81,4 +82,12 @@ if(BUILD_TESTING)
   add_executable(test_transition tests/test_transition.cpp)
   target_link_libraries(test_transition PRIVATE walleclipse_core)
   add_test(NAME transition COMMAND test_transition)
+
+  add_executable(test_poster tests/test_poster.cpp)
+  target_link_libraries(test_poster PRIVATE walleclipse_core)
+  add_test(NAME poster COMMAND test_poster)
+
+  add_executable(test_media tests/test_media.cpp)
+  target_link_libraries(test_media PRIVATE walleclipse_core)
+  add_test(NAME media COMMAND test_media)
 endif()

@@ -23,7 +23,9 @@ public:
         std::function<void(const std::string& monitor, const std::string& path, SlideDir dir,
                            int fromWs, int toWs)>
             showStatic;
-        std::function<void(const std::string& monitor, const std::string& path)> showAnimated;
+        std::function<void(const std::string& monitor, const std::string& path, SlideDir dir,
+                           int fromWs, int toWs)>
+            showAnimated;
         std::function<void(const std::string& where, const std::string& msg)> onError;
         std::function<void(const std::string& where, const std::string& msg)> onInfo;
     };

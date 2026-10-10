@@ -138,7 +138,7 @@ void HyprListener::handleRefresh() {
             break;
         case SwitchAction::ShowAnimated:
             if (h_.showAnimated)
-                h_.showAnimated(monitor, *target);
+                h_.showAnimated(monitor, *target, dir, fromId, ws);
             currentWallpaper_[monitor] = *target;
             break;
         case SwitchAction::RestoreStatic:

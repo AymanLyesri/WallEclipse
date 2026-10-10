@@ -1,11 +1,16 @@
 #include "walleclipse/MediaDelegate.hpp"
 
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
 #include <fcntl.h>
+#include <memory>
 #include <signal.h>
 #include <string>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -108,4 +113,54 @@ void MediaDelegate::applyTheme(const std::string& wallpaper) {
     std::vector<char*> argv = {const_cast<char*>(script.data()),
                                const_cast<char*>(w.data())};
     spawnDetached(argv);
+}
+
+bool MediaDelegate::foreignSurfaceListed(const std::string& jqOutput) {
+    size_t pos = 0;
+    while (pos < jqOutput.size()) {
+        size_t end = jqOutput.find('\n', pos);
+        std::string line = jqOutput.substr(pos, end == std::string::npos ? end : end - pos);
+        if (end == std::string::npos)
+            pos = jqOutput.size();
+        else
+            pos = end + 1;
+        size_t s = line.find_first_not_of(" \t\r");
+        if (s == std::string::npos)
+            continue;
+        size_t e = line.find_last_not_of(" \t\r");
+        line = line.substr(s, e - s + 1);
+        if (!line.empty() && line != "walleclipse")
+            return true;
+    }
+    return false;
+}
+
+bool MediaDelegate::waitForPlayer(const std::string& monitor, int timeoutMs) {
+    // Monitor names come from hyprctl (DP-2, HDMI-A-1); refuse anything
+    // that would break the single-quoted shell embedding below.
+    if (monitor.empty() || monitor.find('\'') != std::string::npos)
+        return false;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::string cmd = "hyprctl layers -j 2>/dev/null | jq -r --arg m '" + monitor +
+                          "' '.[$m].levels.\"0\"[].namespace // empty' 2>/dev/null";
+        std::string out;
+        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+        if (pipe) {
+            std::array<char, 256> buf{};
+            size_t n = 0;
+            while ((n = std::fread(buf.data(), 1, buf.size(), pipe.get())) > 0)
+                out.append(buf.data(), n);
+        }
+        if (foreignSurfaceListed(out)) {
+            // Surface exists but mpv may not have attached its first
+            // frame yet: hold our poster one beat longer so the handoff
+            // never shows a blank frame in between.
+            std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
 }

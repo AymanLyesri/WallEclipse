@@ -2,6 +2,10 @@
 
 Preloaded layer-shell wallpaper daemon for Hyprland. Extension of [ArchEclipse](https://github.com/AymanLyesri/ArchEclipse).
 Replaces `hyprpaper` + `wallpaper-loop.c`; `mpvpaper` stays for animated wallpapers (gif/mp4/webm).
+Workspace slide transitions also cover animated wallpapers via a static
+poster bridge: the first switch to/from a video slides to/from its
+extracted poster frame (cached in `~/.cache/walleclipse/posters`),
+then hands off to `mpvpaper`.
 
 ## Why
 

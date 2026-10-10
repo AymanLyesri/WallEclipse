@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <thread>
 
 #include "walleclipse/ConfigStore.hpp"
@@ -26,6 +28,7 @@
 #include "walleclipse/Ipc.hpp"
 #include "walleclipse/MediaDelegate.hpp"
 #include "walleclipse/Preloader.hpp"
+#include "walleclipse/VideoPoster.hpp"
 #include "walleclipse/WaylandBackend.hpp"
 
 namespace {
@@ -170,12 +173,16 @@ int main(int argc, char** argv) {
     }
 
     // Warm the cover-fit cache: the ~90ms scale per wallpaper happens here,
-    // once, instead of on the first visit to each workspace.
+    // once, instead of on the first visit to each workspace. Animated
+    // posters are precached too so slides to/from video start instantly.
     for (const auto& mon : monitors)
         for (const auto& [ws, path] : store.wallpapersFor(mon)) {
             (void)ws;
-            if (isMediaWallpaper(path))
+            if (isMediaWallpaper(path)) {
+                if (auto poster = preloader.getPoster(path))
+                    backend.precache(mon, poster);
                 continue;
+            }
             if (auto img = preloader.get(path))
                 backend.precache(mon, img);
         }
@@ -200,15 +207,50 @@ int main(int argc, char** argv) {
         out = *v;
         return true;
     };
+    // Last shown path per monitor (listener + IPC threads). Needed to
+    // find the poster of a running video when leaving it: the layer
+    // surface is hidden while mpvpaper shows, so the return slide
+    // starts from the poster, not from a stale static frame.
+    std::map<std::string, std::string> shown;
+    std::mutex shownMutex;
+    auto getShown = [&](const std::string& mon) -> std::string {
+        std::lock_guard<std::mutex> lock(shownMutex);
+        auto it = shown.find(mon);
+        return it == shown.end() ? std::string() : it->second;
+    };
+    auto setShown = [&](const std::string& mon, const std::string& path) {
+        std::lock_guard<std::mutex> lock(shownMutex);
+        shown[mon] = path;
+    };
+    // Poster with on-demand extraction (first visit pays ~250ms once,
+    // then disk + RAM cached). Null when extraction fails — callers
+    // fall back to the previous instant cut.
+    auto posterFor = [&](const std::string& path) -> std::shared_ptr<DecodedImage> {
+        if (auto p = preloader.getPoster(path))
+            return std::shared_ptr<DecodedImage>(p);
+        preloader.preloadPosterOne(path);
+        return preloader.getPoster(path);
+    };
+    // Hand the monitor to mpvpaper without a blank frame in between:
+    // the player spawns async, so our poster stays mapped until its
+    // layer surface appears (plus a beat for its first frame) and only
+    // then is hidden. Works regardless of surface stacking order.
+    auto handoffToVideo = [&](const std::string& mon, const std::string& path) {
+        std::string expanded;
+        ConfigStore::expandPath(path, expanded);
+        MediaDelegate::playOnMonitor(mon, expanded.empty() ? path : expanded);
+        if (!MediaDelegate::waitForPlayer(mon))
+            logLine("change_wallpaper", "mpvpaper slow on '" + mon +
+                                            "' — hid poster before first frame");
+        backend.hideMonitor(mon);
+    };
     handlers.showStatic = [&](const std::string& mon, const std::string& path, SlideDir dir,
                                 int, int) {
         // Animated slipped into a static slot? Delegate (never render garbage).
         if (isMediaWallpaper(path)) {
-            backend.hideMonitor(mon);
-            std::string expanded;
-            ConfigStore::expandPath(path, expanded);
-            MediaDelegate::playOnMonitor(mon, expanded.empty() ? path : expanded);
+            handoffToVideo(mon, path);
             MediaDelegate::applyTheme(path);
+            setShown(mon, path);
             return;
         }
         auto img = preloader.get(path);
@@ -220,17 +262,48 @@ int main(int argc, char** argv) {
             logLine("change_wallpaper", "cannot decode '" + path + "' — keeping previous");
             return;
         }
+        if (!backend.isMapped(mon)) {
+            // Coming from video: restore its poster under mpvpaper first
+            // (invisible), so killing the player reveals the poster and
+            // the slide starts there instead of cutting from black.
+            std::string prev = getShown(mon);
+            if (isMediaWallpaper(prev)) {
+                if (auto poster = posterFor(prev))
+                    backend.remapWithImage(mon, poster);
+            }
+        }
         MediaDelegate::stopForMonitor(mon); // leaving video -> kill mpvpaper first
         if (!backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img), dir))
             logLine("change_wallpaper", "unknown monitor '" + mon + "'");
+        setShown(mon, path);
         writeCurrentConf(path);
         std::thread([path] { MediaDelegate::applyTheme(path); }).detach();
     };
-    handlers.showAnimated = [&](const std::string& mon, const std::string& path) {
-        backend.hideMonitor(mon);
-        std::string expanded;
-        ConfigStore::expandPath(path, expanded);
-        MediaDelegate::playOnMonitor(mon, expanded.empty() ? path : expanded);
+    handlers.showAnimated = [&](const std::string& mon, const std::string& path,
+                                SlideDir dir, int, int) {
+        if (backend.isMapped(mon)) {
+            // Static -> animated: slide the old frame out to the video's
+            // poster while still mapped, then hand off to mpvpaper.
+            if (auto poster = posterFor(path))
+                backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(poster),
+                                     dir);
+        } else {
+            // Animated -> animated: reveal the old poster under the
+            // player, slide poster -> poster, then hand off.
+            std::string prev = getShown(mon);
+            if (isMediaWallpaper(prev)) {
+                auto oldPoster = posterFor(prev);
+                auto newPoster = posterFor(path);
+                if (oldPoster && newPoster &&
+                    backend.remapWithImage(mon, oldPoster)) {
+                    MediaDelegate::stopForMonitor(mon); // reveal old poster
+                    backend.setWallpaper(
+                        mon, std::shared_ptr<const DecodedImage>(newPoster), dir);
+                }
+            }
+        }
+        handoffToVideo(mon, path);
+        setShown(mon, path);
         writeCurrentConf(path);
         MediaDelegate::applyTheme(path);
     };
@@ -259,12 +332,14 @@ int main(int argc, char** argv) {
                 return false;
             std::string out = path;
             if (isMediaWallpaper(out)) {
-                backend.hideMonitor(mon);
-                std::string expanded;
-                ConfigStore::expandPath(out, expanded);
-                MediaDelegate::playOnMonitor(mon, expanded.empty() ? out : expanded);
+                // No slide out-of-band, but keep the current frame up
+                // until the player is ready (same no-blank handoff).
+                // Poster warmed so the next switch slides.
+                preloader.preloadPosterOne(out);
+                handoffToVideo(mon, out);
                 if (activeListener)
                     activeListener->noteShown(mon, out);
+                setShown(mon, out);
                 writeCurrentConf(out);
             } else {
                 preloader.preloadOne(out);
@@ -274,6 +349,7 @@ int main(int argc, char** argv) {
                     backend.setWallpaper(mon, std::shared_ptr<const DecodedImage>(img));
                     if (activeListener)
                         activeListener->noteShown(mon, out);
+                    setShown(mon, out);
                     writeCurrentConf(out);
                 }
             }
