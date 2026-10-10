@@ -50,6 +50,8 @@ HyprListener::parseSnapshotLines(const std::string& text) {
         std::string name = line.substr(0, sp);
         if (name.empty() || name.find("special") != std::string::npos)
             continue;
+        if (name == "FALLBACK")
+            continue; // transient resume state, not a real monitor
         try {
             int ws = std::stoi(line.substr(sp + 1));
             out.emplace_back(name, ws);
@@ -61,7 +63,9 @@ HyprListener::parseSnapshotLines(const std::string& text) {
 
 bool HyprListener::isRefreshEvent(const std::string& line) {
     return line.find("workspace") != std::string::npos ||
-           line.find("focusedmon") != std::string::npos;
+           line.find("focusedmon") != std::string::npos ||
+           line.find("monitoradded") != std::string::npos ||
+           line.find("monitorremoved") != std::string::npos;
 }
 
 HyprListener::SwitchAction

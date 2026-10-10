@@ -36,12 +36,21 @@ int main() {
     CHECK(pairs[0].first == "DP-2" && pairs[0].second == 3);
     CHECK(pairs[1].first == "HDMI-1" && pairs[1].second == 1);
 
+    // Resume transient: FALLBACK entries are ignored, real monitors kept.
+    std::string snapResume = "FALLBACK 1\nDP-2 3\n";
+    auto pairsResume = HyprListener::parseSnapshotLines(snapResume);
+    CHECK(pairsResume.size() == 1);
+    CHECK(pairsResume[0].first == "DP-2" && pairsResume[0].second == 3);
+
     // Event filter: workspace substring (incl. moveworkspace/workspacev2)
     // and focusedmon trigger; everything else ignored.
     CHECK(HyprListener::isRefreshEvent("workspace>>3"));
     CHECK(HyprListener::isRefreshEvent("moveworkspace>>1,DP-2"));
     CHECK(HyprListener::isRefreshEvent("workspacev2>>3,addr"));
     CHECK(HyprListener::isRefreshEvent("focusedmon>>DP-2,1"));
+    CHECK(HyprListener::isRefreshEvent("monitoradded>>DP-2"));
+    CHECK(HyprListener::isRefreshEvent("monitorremoved>>DP-2"));
+    CHECK(!HyprListener::isRefreshEvent("dpmsmon>>1"));
     CHECK(!HyprListener::isRefreshEvent("activewindow>>class,title"));
     CHECK(!HyprListener::isRefreshEvent(""));
 

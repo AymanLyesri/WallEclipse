@@ -42,6 +42,8 @@ public:
 
     // Pure helper, unit-tested: parse `hyprctl monitors -j | jq` lines
     // of "<name> <workspaceId>" into pairs. Skips blanks/special.
+    // Entries named FALLBACK (Hyprland's transient resume state) are
+    // also skipped — they are not real monitors.
     static std::vector<std::pair<std::string, int>>
     parseSnapshotLines(const std::string& text);
 
@@ -58,7 +60,8 @@ public:
 
     // Pure helper: does a socket2 line merit a wallpaper refresh?
     // Mirrors wallpaper-loop.c ("workspace" substring incl. moveworkspace,
-    // plus focusedmon; workspacev2 covered by substring).
+    // plus focusedmon; workspacev2 covered by substring). Monitor
+    // add/remove (sleep/resume, hotplug) also trigger a refresh.
     static bool isRefreshEvent(const std::string& line);
 
 private:
