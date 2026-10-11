@@ -55,6 +55,22 @@ int main() {
     ConfigStore::expandPath("~/wall.jpg", out);
     CHECK(out == std::string(std::getenv("HOME")) + "/wall.jpg");
 
+    // Workspace transition: missing file defaults to slide.
+    CHECK(store.getTransition() == "slide");
+    // Round-trip fade, persists across instances (reload/reboot).
+    CHECK(store.setTransition("fade"));
+    CHECK(store.getTransition() == "fade");
+    CHECK(ConfigStore(tmp + "/config").getTransition() == "fade");
+    // Unknown names rejected, previous value kept.
+    CHECK(!store.setTransition("bogus"));
+    CHECK(store.getTransition() == "fade");
+    // Garbage on disk falls back to slide.
+    {
+        std::ofstream bad(tmp + "/config/transition", std::ios::trunc);
+        bad << "  wobble\n";
+    }
+    CHECK(store.getTransition() == "slide");
+
     fs::remove_all(tmp);
     if (failures == 0)
         std::cout << "test_configstore: all passed\n";

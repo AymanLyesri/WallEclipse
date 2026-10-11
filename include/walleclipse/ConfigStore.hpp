@@ -27,6 +27,13 @@ public:
     // flock-guarded read-modify-write. Creates w-<ws> key if missing.
     bool setWallpaper(const std::string& monitor, int workspace, const std::string& path);
 
+    // Workspace-switch transition ("slide"/"fade"/"none"), persisted in
+    // <baseDir>/transition so it survives reload + reboot. Missing or
+    // invalid content reads back as "slide". setTransition validates via
+    // makeTransition() and rejects unknown names.
+    std::string getTransition() const;
+    bool setTransition(const std::string& name);
+
     const std::string& baseDir() const { return baseDir_; }
 
     static void expandPath(const std::string& in, std::string& out);

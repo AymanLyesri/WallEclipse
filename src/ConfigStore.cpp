@@ -1,4 +1,5 @@
 #include "walleclipse/ConfigStore.hpp"
+#include "walleclipse/Transition.hpp"
 #include "walleclipse/Util.hpp"
 
 #include <algorithm>
@@ -147,4 +148,26 @@ bool ConfigStore::setWallpaper(const std::string& monitor, int workspace,
     flock(lockFd, LOCK_UN);
     ::close(lockFd);
     return ok;
+}
+
+std::string ConfigStore::getTransition() const {
+    std::ifstream fp(baseDir_ + "/transition");
+    std::string line;
+    if (!std::getline(fp, line))
+        return "slide";
+    line = trimWs(line);
+    return makeTransition(line) ? line : "slide";
+}
+
+bool ConfigStore::setTransition(const std::string& name) {
+    std::string clean = trimWs(name);
+    if (!makeTransition(clean))
+        return false;
+    std::error_code ec;
+    fs::create_directories(baseDir_, ec);
+    std::ofstream fp(baseDir_ + "/transition", std::ios::trunc);
+    if (!fp)
+        return false;
+    fp << clean << "\n";
+    return static_cast<bool>(fp);
 }

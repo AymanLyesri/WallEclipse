@@ -54,6 +54,7 @@ void printHelp(const char* argv0) {
               << "  " << argv0 << " set MON WS PATH  set workspace wallpaper\n"
               << "  " << argv0 << " preload PATH     preload into daemon cache\n"
               << "  " << argv0 << " reload           re-read config + re-apply current\n"
+              << "  " << argv0 << " transition [name] query/set workspace transition\n"
               << "  " << argv0 << " current|list     query daemon\n";
 }
 
@@ -105,6 +106,12 @@ int main(int argc, char** argv) {
         (std::strcmp(argv[1], "current") == 0 || std::strcmp(argv[1], "list") == 0 ||
          std::strcmp(argv[1], "reload") == 0)) {
         return runClient(argv[1]);
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "transition") == 0) {
+        std::string req = "TRANSITION";
+        if (argc >= 3)
+            req += " " + std::string(argv[2]);
+        return runClient(req);
     }
     if (argc >= 2 &&
         (std::strcmp(argv[1], "--help") == 0 || std::strcmp(argv[1], "-h") == 0)) {
@@ -168,6 +175,9 @@ int main(int argc, char** argv) {
         logLine("main", "Wayland backend init failed");
         return 1;
     }
+    // Workspace-switch transition persists across reload + reboot
+    // (missing/invalid file reads back as slide).
+    backend.setTransition(store.getTransition());
 
     // Warm the cover-fit cache: the ~90ms scale per wallpaper happens here,
     // once, instead of on the first visit to each workspace. Animated
@@ -326,9 +336,19 @@ int main(int argc, char** argv) {
             // Re-read config from disk (picks up external edits), preload
             // any new paths, then re-apply current workspace wallpapers.
             preloader.preloadAll(store);
+            backend.setTransition(store.getTransition());
             if (activeListener)
                 activeListener->applyCurrent();
             logLine("ipc", "reloaded config");
+        };
+        ih.transition = [&](const std::string& name) {
+            if (name.empty())
+                return backend.transition();
+            if (!store.setTransition(name))
+                return std::string();
+            // Apply the canonical stored value (trimmed), not the raw arg.
+            backend.setTransition(store.getTransition());
+            return backend.transition();
         };
         ih.set = [&](const std::string& mon, int ws, const std::string& path) {
             if (!store.setWallpaper(mon, ws, path))

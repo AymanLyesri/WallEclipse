@@ -91,4 +91,8 @@ if(BUILD_TESTING)
   add_executable(test_media tests/test_media.cpp)
   target_link_libraries(test_media PRIVATE walleclipse_core)
   add_test(NAME media COMMAND test_media)
+
+  add_executable(test_ipc tests/test_ipc.cpp)
+  target_link_libraries(test_ipc PRIVATE walleclipse_core)
+  add_test(NAME ipc COMMAND test_ipc)
 endif()

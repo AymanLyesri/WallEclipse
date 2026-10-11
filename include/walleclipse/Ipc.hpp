@@ -10,6 +10,9 @@
 //   CURRENT                   print current.conf content
 //   LIST                      print "<monitor> <ws> <path>" lines
 //   RELOAD                    re-read config, preload new paths, re-apply current
+//   TRANSITION [name]         query (no arg) or set the workspace-switch
+//                             transition (slide|fade|none); set persists to
+//                             disk so it survives reload + reboot
 //   QUIT                      stop the daemon (local user only)
 class Ipc {
 public:    struct Handlers {
@@ -18,6 +21,9 @@ public:    struct Handlers {
         std::function<std::string()> current;
         std::function<std::string()> list;
         std::function<void()> reload;
+        // Empty name = query (return current); otherwise validate, persist
+        // and apply, returning the new value (empty = rejected -> ERR).
+        std::function<std::string(const std::string& name)> transition;
         std::function<void()> quit;
     };
 

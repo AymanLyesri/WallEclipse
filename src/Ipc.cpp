@@ -93,6 +93,10 @@ bool Ipc::serve(Handlers h) {
             if (h.reload)
                 h.reload();
             reply = "OK\n";
+        } else if (upperOf(line.substr(0, 10)) == "TRANSITION") {
+            std::string arg = trimWs(line.size() > 10 ? line.substr(10) : "");
+            std::string res = h.transition ? h.transition(arg) : "";
+            reply = res.empty() ? "ERR bad transition (slide|fade|none)\n" : res + "\n";
         } else if (upperOf(line) == "QUIT") {
             reply = "OK\n";
             stop = true;
