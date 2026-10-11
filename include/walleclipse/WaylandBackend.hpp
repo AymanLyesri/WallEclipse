@@ -35,15 +35,18 @@ public:
     // otherwise it pends until configure arrives (never attaches early:
     // that is a fatal protocol error).
     // The SlideDir overload animates via the active TransitionEffect
-    // (default "slide"); SlideDir::None (and the 2-arg overload) attaches
-    // instantly. Direction comes from workspace order (see Transition.hpp).
+    // (default "slide" for workspace switches); set/reload/init arrive
+    // with SlideDir::None and cross-fade (black->new on first paint).
+    // The 2-arg overloads fade the same way. "none" disables animation.
+    // Direction comes from workspace order (see Transition.hpp).
     bool setWallpaper(const std::string& monitor, const DecodedImage& img);
     bool setWallpaper(const std::string& monitor, std::shared_ptr<const DecodedImage> img);
     bool setWallpaper(const std::string& monitor, std::shared_ptr<const DecodedImage> img,
                       SlideDir dir);
 
-    // Swap the transition effect ("slide", "none", ...). Unknown names are
-    // ignored. Future effects plug in via makeTransition().
+    // Swap the transition effect ("slide", "fade", "none", ...). Unknown names are
+    // ignored. Directional switches use the active effect; set/reload/init
+    // (SlideDir::None) cross-fade unless set to "none".
     void setTransition(const std::string& name);
     std::string transition() const;
 

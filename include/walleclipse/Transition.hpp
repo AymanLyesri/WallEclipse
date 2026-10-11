@@ -17,6 +17,11 @@ enum class SlideDir { Forward, Backward, None };
 // show) or equal ids -> None (instant, no slide).
 SlideDir slideDirForWorkspaces(std::optional<int> from, int to);
 
+// Pure helper: which transition effect to run. Directional switches use
+// the active transition ("slide"); set/reload/init arrive with None and
+// cross-fade unless transitions are disabled ("none").
+std::string effectNameFor(SlideDir dir, const std::string& active);
+
 class TransitionEffect {
 public:
     virtual ~TransitionEffect() = default;
@@ -34,8 +39,8 @@ public:
                                         SlideDir dir) const = 0;
 };
 
-// Factory: "slide" (directional), "none" (instant cut).
-// Returns nullptr for unknown names. Add future effects here.
+// Factory: "slide" (directional), "fade" (cross-blend for set/reload/init),
+// "none" (instant cut). Returns nullptr for unknown names.
 std::unique_ptr<TransitionEffect> makeTransition(const std::string& name);
 
 // Cover-fit result cache: scaling a multi-megapixel source costs ~90ms at

@@ -10,6 +10,12 @@ SlideDir slideDirForWorkspaces(std::optional<int> from, int to) {
     return to > *from ? SlideDir::Forward : SlideDir::Backward;
 }
 
+std::string effectNameFor(SlideDir dir, const std::string& active) {
+    if (dir == SlideDir::None && active != "none")
+        return "fade";
+    return active;
+}
+
 namespace {
 
 // Mirrors Hyprland workspaces slide duration. animations.lua sets
@@ -72,11 +78,42 @@ public:
     }
 };
 
+class FadeTransition : public TransitionEffect {
+public:
+    int durationMs() const override { return kSlideDurationMs; }
+    double eased(double t) const override {
+        t = std::clamp(t, 0.0, 1.0);
+        return 1.0 - std::pow(1.0 - t, 3.0);
+    }
+    std::vector<uint8_t> render(const std::vector<uint8_t>& oldFrame,
+                                const std::vector<uint8_t>& newFrame, int w, int h,
+                                double progress, SlideDir) const override {
+        if (progress <= 0.0)
+            return oldFrame;
+        if (progress >= 1.0)
+            return newFrame;
+        if (oldFrame.size() != newFrame.size() ||
+            oldFrame.size() != static_cast<size_t>(w) * h * 4)
+            return newFrame;
+        double a = eased(progress);
+        // Integer blend: one float->int per frame, then pure integer
+        // math per byte (per-byte lround costs ~35ms/frame at 1080p).
+        int wa = static_cast<int>(a * 256.0 + 0.5);
+        int wo = 256 - wa;
+        std::vector<uint8_t> out(oldFrame.size());
+        for (size_t i = 0; i < out.size(); ++i)
+            out[i] = static_cast<uint8_t>((oldFrame[i] * wo + newFrame[i] * wa + 128) >> 8);
+        return out;
+    }
+};
+
 } // namespace
 
 std::unique_ptr<TransitionEffect> makeTransition(const std::string& name) {
     if (name == "slide")
         return std::make_unique<SlidingTransition>();
+    if (name == "fade")
+        return std::make_unique<FadeTransition>();
     if (name == "none")
         return std::make_unique<NoneTransition>();
     return nullptr;

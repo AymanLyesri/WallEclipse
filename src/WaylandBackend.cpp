@@ -18,6 +18,8 @@
 struct OutputInfo {
     WaylandBackend::Impl* impl = nullptr;
     wl_output* output = nullptr;
+    uint32_t global = 0; // wl_registry global name for hotplug removal
+    uint32_t wlVersion = 0; // bound wl_output version (release iff >= 3)
     zxdg_output_v1* xdg = nullptr;
     std::string name;
     int32_t width = 0;   // from mode (physical px)
@@ -76,6 +78,17 @@ struct WaylandBackend::Impl {
     zwlr_layer_shell_v1* layerShell = nullptr;
     zxdg_output_manager_v1* xdgOutMgr = nullptr;
     std::map<wl_output*, std::unique_ptr<OutputInfo>> outputs;
+    std::map<uint32_t, wl_output*> globalToOutput;
+    // Pending images stashed by monitor name when their wl_output global
+    // is removed (sleep/disconnect). Restored when the monitor re-appears
+    // (xdg name event) so the wallpaper self-heals even if the workspace
+    // is unchanged and no setWallpaper arrives.
+    std::map<std::string, std::shared_ptr<const DecodedImage>> pendingByMonitor;
+    // Retired outputs whose proxies are destroyed but whose listener
+    // userdata may still fire from already-queued Wayland events. Kept
+    // alive (detached, impl=null) so those late callbacks are safe no-ops
+    // instead of use-after-free. Bounded below.
+    std::vector<std::unique_ptr<OutputInfo>> dead;
     std::mutex mutex;
     std::thread dispatchThread;
     bool running = false;
@@ -132,13 +145,9 @@ void destroyPoolsLocked(OutputInfo* out) {
     }
 }
 
-void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
-    auto* out = static_cast<OutputInfo*>(data);
-    if (!out->impl)
-        return;
-    // Surface is gone (reload/reconfigure): tear down so the next
-    // setWallpaper recreates it and waits for configure before attaching.
-    std::lock_guard<std::mutex> lock(out->impl->mutex);
+// Call with impl->mutex held. Tears down the layer surface/buffer/pools
+// but keeps pending so a later configure or setWallpaper re-attaches.
+void teardownSurfaceLocked(OutputInfo* out) {
     out->configured = false;
     out->mapped = false;
     ++out->generation; // cancel any in-flight slide
@@ -155,6 +164,16 @@ void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
         out->buffer = nullptr;
     }
     destroyPoolsLocked(out);
+}
+
+void layerClosed(void* data, zwlr_layer_surface_v1* /*layer*/) {
+    auto* out = static_cast<OutputInfo*>(data);
+    if (!out->impl)
+        return;
+    // Surface is gone (reload/reconfigure/sleep): tear down so the next
+    // setWallpaper recreates it and waits for configure before attaching.
+    std::lock_guard<std::mutex> lock(out->impl->mutex);
+    teardownSurfaceLocked(out);
     // Visible in [wayland] logs so the next blank-screen report shows
     // whether the compositor closed us (sleep/DPMS/reload) and we are
     // waiting on a repaint. pending survives: the next configure or
@@ -188,8 +207,29 @@ const wl_output_listener kOutputListener = {outputGeometry, outputMode, outputDo
                                             outputDescription};
 
 void xdgName(void* data, zxdg_output_v1*, const char* name) {
-    if (name)
-        static_cast<OutputInfo*>(data)->name = name;
+    if (!name)
+        return;
+    auto* out = static_cast<OutputInfo*>(data);
+    if (!out->impl)
+        return;
+    std::lock_guard<std::mutex> lock(out->impl->mutex);
+    out->name = name;
+    // Monitor (re)appeared after sleep/hotplug: restore the stashed image
+    // and eagerly recreate the layer surface so the wallpaper self-heals
+    // even when the workspace is unchanged (listener would skip repaint).
+    // The configure handler attaches pending; never attach here (fatal
+    // before first acked configure).
+    auto* impl = out->impl;
+    auto it = impl->pendingByMonitor.find(out->name);
+    if (it != impl->pendingByMonitor.end() && it->second) {
+        if (!out->pending)
+            out->pending = it->second;
+        if (impl->compositor && impl->layerShell && out->output && !out->layer) {
+            if (ensureSurfaceLocked(impl, out))
+                impl->vlog("output '" + out->name +
+                           "' reconnected, restoring wallpaper");
+        }
+    }
 }
 void xdgLogicalPosition(void*, zxdg_output_v1*, int32_t, int32_t) {}
 void xdgLogicalSize(void*, zxdg_output_v1*, int32_t, int32_t) {}
@@ -214,12 +254,19 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
         auto info = std::make_unique<OutputInfo>();
         info->impl = self;
         info->output = o;
+        info->global = name;
+        info->wlVersion = v;
         wl_output_add_listener(o, &kOutputListener, info.get());
         if (self->xdgOutMgr) {
             info->xdg = zxdg_output_manager_v1_get_xdg_output(self->xdgOutMgr, o);
             zxdg_output_v1_add_listener(info->xdg, &kXdgListener, info.get());
         }
-        self->outputs[o] = std::move(info);
+        {
+            std::lock_guard<std::mutex> lock(self->mutex);
+            self->globalToOutput[name] = o;
+            self->outputs[o] = std::move(info);
+        }
+        self->vlog("output global " + std::to_string(name) + " added");
     } else if (std::strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         self->layerShell = static_cast<zwlr_layer_shell_v1*>(wl_registry_bind(
             registry, name, &zwlr_layer_shell_v1_interface, 4));
@@ -230,12 +277,51 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
 }
 
 void registryRemove(void* data, wl_registry*, uint32_t name) {
-    // Hotplug-removal destroys surfaces lazily on next setWallpaper/hide.
-    // Logged so sleep/disconnect cycles are visible in [wayland] logs.
+    // The compositor retires the wl_output proxy: any layer surface anchored
+    // to it is dead and will never configure again. Destroy the OutputInfo
+    // now (stashing pending by monitor name) so a later findOutput cannot
+    // return the dead entry and paint into the void (black screen). The
+    // re-added global creates a fresh OutputInfo; xdgName restores pending.
     auto* self = static_cast<WaylandBackend::Impl*>(data);
-    if (self)
-        self->vlog("output global " + std::to_string(name) +
-                   " removed (hotplug/sleep?)");
+    if (!self)
+        return;
+    self->vlog("output global " + std::to_string(name) +
+               " removed (hotplug/sleep?)");
+    std::lock_guard<std::mutex> lock(self->mutex);
+    auto git = self->globalToOutput.find(name);
+    if (git == self->globalToOutput.end())
+        return; // not an output global (compositor/shm/...)
+    wl_output* dead = git->second;
+    self->globalToOutput.erase(git);
+    auto oit = self->outputs.find(dead);
+    if (oit == self->outputs.end())
+        return;
+    OutputInfo* out = oit->second.get();
+    if (!out->name.empty() && out->pending)
+        self->pendingByMonitor[out->name] = out->pending;
+    teardownSurfaceLocked(out);
+    if (out->xdg) {
+        zxdg_output_v1_destroy(out->xdg);
+        out->xdg = nullptr;
+    }
+    // wl_output.release exists since v3 and destroys the proxy; older
+    // binds fall back to a plain proxy destroy.
+    if (out->wlVersion >= 3)
+        wl_output_release(dead);
+    else
+        wl_output_destroy(dead);
+    out->output = nullptr;
+    out->impl = nullptr; // detach: late compositor events become no-ops
+    // Retire instead of freeing: already-queued events may still carry
+    // the dead OutputInfo* as userdata. Bounded graveyard, negligible size
+    // (pools/surfaces already destroyed).
+    self->dead.push_back(std::move(oit->second));
+    self->outputs.erase(oit);
+    while (self->dead.size() > 16)
+        self->dead.erase(self->dead.begin());
+    // Wake the display so a racing roundtrip notices the removal promptly.
+    if (self->display)
+        wl_display_flush(self->display);
 }
 
 const wl_registry_listener kRegistryListener = {registryGlobal, registryRemove};
@@ -452,8 +538,15 @@ bool WaylandBackend::init(LogFn log) {
     impl_->running = true;
     impl_->dispatchThread = std::thread([impl = impl_.get()] {
         while (impl->running) {
-            if (wl_display_dispatch(impl->display) < 0)
+            if (wl_display_dispatch(impl->display) < 0) {
+                // Sleep/DPMS must NOT kill event flow silently: without
+                // dispatch, configure/close/global events stop and every
+                // later paint pends forever (black screen). Log so the
+                // next report shows whether the loop died.
+                if (impl->running)
+                    impl->vlog("wl_display_dispatch error; event loop stopped");
                 break;
+            }
         }
     });
     return true;
@@ -506,6 +599,7 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
         if (!out || !ensureSurfaceLocked(impl_.get(), out))
             return false;
         out->pending = img;
+        impl_->pendingByMonitor[monitor] = img;
         myGen = ++out->generation;
         wasConfigured = out->configured;
         wasMapped = out->mapped;
@@ -522,10 +616,29 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
         return out && out->generation == myGen;
     };
 
-    // Instant when: no direction, first paint, unmapped, or no cached frame.
+    // Set/reload/init arrive with None and cross-fade (old->new, or
+    // black->new on first paint); workspace switches slide. "none"
+    // disables all animation.
+    std::string want = effectNameFor(dir, transName);
+    auto effect = makeTransition(want);
     bool haveOld = wasMapped && !oldFrame.empty() &&
                    oldFrame.size() == newArgb.size();
-    if (dir == SlideDir::None || !wasConfigured || !haveOld) {
+    // First paint fades in from black (opaque). Only for never-shown
+    // surfaces: a stale frame + unmapped means hidden-for-video, which
+    // needs the empty-commit remap below (direct attach is a protocol
+    // error after a nil attach).
+    std::vector<uint8_t> from = oldFrame;
+    bool fadeFromBlack = (dir == SlideDir::None && oldFrame.empty() &&
+                          !wasMapped && effect && effect->durationMs() > 0);
+    if (fadeFromBlack) {
+        from.assign(newArgb.size(), 0);
+        for (size_t i = 3; i < from.size(); i += 4)
+            from[i] = 0xFF;
+    }
+    // Instant when: transitions disabled, surface not configured yet
+    // (pends until configure), slide with no frame, or size mismatch.
+    if (!effect || effect->durationMs() <= 0 || !wasConfigured ||
+        (!haveOld && !fadeFromBlack)) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         OutputInfo* out = findOutput(impl_.get(), monitor);
         if (!out || out->generation != myGen)
@@ -543,17 +656,6 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
         return true;
     }
 
-    auto effect = makeTransition(transName);
-    if (!effect || effect->durationMs() <= 0) {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        OutputInfo* out = findOutput(impl_.get(), monitor);
-        if (!out || out->generation != myGen)
-            return true;
-        if (out->configured && out->mapped)
-            attachPixelsLocked(out, newArgb, w, h);
-        return true;
-    }
-
     int duration = effect->durationMs();
     // 120fps target: even cadence on 60Hz and 144Hz panels. Deadline-based
     // pacing (not fixed sleep) so frame work time doesn't drag the rate.
@@ -563,9 +665,9 @@ bool WaylandBackend::setWallpaper(const std::string& monitor,
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 1; i <= frames; ++i) {
         if (!isCurrent())
-            return true; // superseded (or hidden) mid-slide
+            return true; // superseded (or hidden) mid-animation
         double progress = static_cast<double>(i) / frames;
-        auto frame = effect->render(oldFrame, newArgb, w, h, progress, dir);
+        auto frame = effect->render(from, newArgb, w, h, progress, dir);
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             OutputInfo* out = findOutput(impl_.get(), monitor);
@@ -631,6 +733,7 @@ bool WaylandBackend::remapWithImage(const std::string& monitor,
         if (!ensureSurfaceLocked(impl_.get(), out))
             return false;
         out->pending = std::move(img);
+        impl_->pendingByMonitor[monitor] = out->pending;
         ++out->generation;
         if (!out->surface)
             return false;
@@ -656,6 +759,7 @@ void WaylandBackend::hideMonitor(const std::string& monitor) {
     if (!out)
         return;
     out->pending.reset(); // stay hidden across future configures
+    impl_->pendingByMonitor.erase(monitor);
     ++out->generation;    // cancel any in-flight slide
     if (!out->surface || !out->mapped)
         return; // already unmapped: no commit needed

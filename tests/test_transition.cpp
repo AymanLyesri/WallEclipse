@@ -1,5 +1,7 @@
 // Transition unit tests: sliding direction from workspace order + frame compositing.
 // Pure logic, no compositor needed.
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -41,6 +43,8 @@ int main() {
     CHECK(makeTransition("nope") == nullptr);
     auto none = makeTransition("none");
     CHECK(none != nullptr);
+    auto fade = makeTransition("fade");
+    CHECK(fade != nullptr);
 
     // Duration mirrors Hyprland workspaces anim (positive, shared default).
     CHECK(slide->durationMs() > 0);
@@ -91,6 +95,52 @@ int main() {
     // None direction = instant cut to new.
     auto fNone = slide->render(oldF, newF, w, h, 0.5, SlideDir::None);
     CHECK(fNone == newF);
+
+    // Fade: cross-blend old->new, direction-independent (set/reload/init
+    // all arrive with SlideDir::None). Same Hyprland timing as slide.
+    CHECK(fade->durationMs() > 0);
+    CHECK(fade->durationMs() == slide->durationMs());
+    CHECK(fade->eased(0.0) == 0.0);
+    CHECK(fade->eased(1.0) == 1.0);
+    double feHalf = fade->eased(0.5);
+    CHECK(feHalf > 0.5 && feHalf < 1.0);
+    auto g0 = fade->render(oldF, newF, w, h, 0.0, SlideDir::None);
+    auto g1 = fade->render(oldF, newF, w, h, 1.0, SlideDir::None);
+    CHECK(g0 == oldF);
+    CHECK(g1 == newF);
+    // Mid-blend: every pixel is a lerp, not a cut. Red(255,0,0)->Blue(0,0,255)
+    // in BGR mem: B goes 0->255, R goes 255->0 by eased alpha.
+    auto gMid = fade->render(oldF, newF, w, h, 0.5, SlideDir::None);
+    CHECK(gMid.size() == oldF.size());
+    {
+        double a = fade->eased(0.5);
+        uint8_t expB = static_cast<uint8_t>(std::lround(255.0 * a));
+        uint8_t expR = static_cast<uint8_t>(std::lround(255.0 * (1.0 - a)));
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* px = &gMid[static_cast<size_t>(x) * 4];
+            CHECK(px[3] == 0xFF);
+            CHECK(std::abs(static_cast<int>(px[0]) - expB) <= 1);
+            CHECK(px[1] == 0);
+            CHECK(std::abs(static_cast<int>(px[2]) - expR) <= 1);
+        }
+    }
+    // Direction is ignored: Forward/Backward blend identically to None.
+    auto gFwd = fade->render(oldF, newF, w, h, 0.5, SlideDir::Forward);
+    auto gBwd = fade->render(oldF, newF, w, h, 0.5, SlideDir::Backward);
+    CHECK(gFwd == gMid);
+    CHECK(gBwd == gMid);
+    // Size mismatch falls back to new (same guard as slide).
+    std::vector<uint8_t> tiny = {1, 2, 3, 4};
+    CHECK(fade->render(tiny, newF, w, h, 0.5, SlideDir::None) == newF);
+
+    // Effect selection: directional switches use the active transition,
+    // while set/reload/init (SlideDir::None) cross-fade unless disabled.
+    CHECK(effectNameFor(SlideDir::Forward, "slide") == "slide");
+    CHECK(effectNameFor(SlideDir::Backward, "slide") == "slide");
+    CHECK(effectNameFor(SlideDir::None, "slide") == "fade");
+    CHECK(effectNameFor(SlideDir::None, "none") == "none");
+    CHECK(effectNameFor(SlideDir::Forward, "none") == "none");
+    CHECK(effectNameFor(SlideDir::None, "fade") == "fade");
 
     // ScaledCache: cover-fit results cached per (source, size), no compositor.
     {
