@@ -1,6 +1,6 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// `$XDG_CACHE_HOME` or `~/.cache` (mirrors `cacheBaseDir()` in Util.cpp).
 pub fn cache_base_dir() -> String {
@@ -51,4 +51,42 @@ pub fn exec_capture(cmd: &str) -> String {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => String::new(),
     }
+}
+
+/// Run `args[0]` with `args[1..]` directly (no shell), wait for exit,
+/// silence stdio. Returns true on exit status 0 (mirrors `runWait()`
+/// in Util.cpp, which fork+execs and waits).
+pub fn run_wait(args: &[&str]) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    match Command::new(args[0])
+        .args(&args[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Spawn `args` detached so it outlives us, with silent stdio (mirrors
+/// `spawnDetached()` in Util.cpp). Implemented via an intermediate
+/// `sh -c '... &'` re-parent (double-fork parity: no zombie, no shell
+/// quoting risk since args travel as positional parameters).
+pub fn spawn_detached(args: &[&str]) {
+    if args.is_empty() {
+        return;
+    }
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("exec \"$@\" >/dev/null 2>&1 </dev/null &")
+        .arg("walleclipse-detach")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
