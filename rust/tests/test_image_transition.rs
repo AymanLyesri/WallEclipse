@@ -80,14 +80,63 @@ fn scale_cover_argb_solid_color() {
     let src = DecodedImage { width: 2, height: 2, rgba: [255, 0, 0, 255].repeat(4) };
     let out = scale_cover_argb(&src, 4, 4);
     assert_eq!(out.len(), 4 * 4 * 4);
-    for px in out.as_chunks::<4>().0 {
+    for px in out.chunks_exact(4) {
         assert_eq!(px, &[0, 0, 255, 255]);
     }
 }
 
 #[test]
+fn scale_cover_argb_wide_to_square_center_crops() {
+    // 4x2 src, left half red / right half blue -> 4x4 dst.
+    // Correct: s = max(4/4, 4/2) = 2, center 2x2 crop, 2x upscale.
+    // Pixel (0,0) samples sx=1.25 (fx=0.25 over red|blue), sy=0.25:
+    // R = 255*0.75 = 191.25 -> 191, B = 255*0.25 = 63.75 -> 64.
+    // The old buggy scale (s=1, oy=-1 stretch) gave pure red [0,0,255,255].
+    let mut rgba = Vec::with_capacity(4 * 2 * 4);
+    for _ in 0..2 {
+        rgba.extend_from_slice(&[255, 0, 0, 255, 255, 0, 0, 255]);
+        rgba.extend_from_slice(&[0, 0, 255, 255, 0, 0, 255, 255]);
+    }
+    let src = DecodedImage { width: 4, height: 2, rgba };
+    let out = scale_cover_argb(&src, 4, 4);
+    assert_eq!(out.len(), 4 * 4 * 4);
+    assert_eq!(&out[0..4], &[64, 0, 191, 255]);
+}
+
+#[test]
+fn scale_cover_argb_tall_to_square_center_crops() {
+    // 2x6 src: rows 0-1 red, rows 2-3 green, rows 4-5 blue -> 6x6 dst.
+    // Correct: s = max(6/2, 6/6) = 3, center 2x2 crop (rows 2-3), 3x upscale.
+    // Dst rows 0-2 sample purely inside green rows 2-3; rows 3-5 blend
+    // toward blue (bilinear seam). Red must appear nowhere (top cropped off).
+    let mut rgba = Vec::with_capacity(2 * 6 * 4);
+    for row in 0..6 {
+        let px = match row {
+            0 | 1 => [255, 0, 0, 255],
+            2 | 3 => [0, 255, 0, 255],
+            _ => [0, 0, 255, 255],
+        };
+        rgba.extend_from_slice(&px);
+        rgba.extend_from_slice(&px);
+    }
+    let src = DecodedImage { width: 2, height: 6, rgba };
+    let out = scale_cover_argb(&src, 6, 6);
+    assert_eq!(out.len(), 6 * 6 * 4);
+    for y in 0..6 {
+        for x in 0..6 {
+            let px = &out[(y * 6 + x) * 4..][..4];
+            assert_eq!(px[2], 0, "no red at ({x},{y}): {px:?}");
+            if y < 3 {
+                assert_eq!(px, &[0, 255, 0, 255], "pure green at ({x},{y})");
+            } else {
+                assert!(px[0] > 0, "blue blend at ({x},{y}): {px:?}");
+            }
+        }
+    }
+}
+#[test]
 fn loads_real_png_jpg_webp() {
-    let dir = std::env::temp_dir().join("walleclipse-task2");
+    let dir = std::env::temp_dir().join(format!("walleclipse-task2-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // 3x2 gradient image.
     let img = image::RgbImage::from_fn(3, 2, |x, y| image::Rgb([(x * 80) as u8, (y * 100) as u8, 128]));

@@ -63,7 +63,7 @@ pub fn scale_cover_argb(src: &DecodedImage, dst_w: u32, dst_h: u32) -> Vec<u8> {
 
     let sw = f64::from(src.width);
     let sh = f64::from(src.height);
-    let s = f64::from(dst_w) / sw.max(f64::from(dst_h) / sh);
+    let s = (f64::from(dst_w) / sw).max(f64::from(dst_h) / sh);
     let src_w = f64::from(dst_w) / s;
     let src_h = f64::from(dst_h) / s;
     let ox = (sw - src_w) / 2.0;

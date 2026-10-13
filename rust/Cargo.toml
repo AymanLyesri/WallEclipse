@@ -13,4 +13,4 @@ path = "src/lib.rs"
 
 [dependencies]
 fs2 = "0.4"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
