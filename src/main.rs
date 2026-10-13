@@ -528,8 +528,8 @@ mod tests {
 
     #[test]
     fn help_uses_argv0() {
-        let h = help_text("walleclipse-rs");
-        assert!(h.contains("walleclipse-rs set MON WS PATH"));
+        let h = help_text("walleclipse");
+        assert!(h.contains("walleclipse set MON WS PATH"));
     }
 
     #[test]

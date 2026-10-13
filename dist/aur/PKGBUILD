@@ -6,8 +6,11 @@ pkgdesc="Preloaded layer-shell wallpaper daemon for Hyprland (hyprpaper replacem
 arch=('x86_64')
 url="https://github.com/AymanLyesri/WallEclipse"
 license=('GPL-3.0-only')
-depends=('wayland' 'libpng' 'libjpeg-turbo' 'libwebp' 'hyprland' 'jq')
-makedepends=('git' 'cmake' 'wayland-protocols')
+depends=('wayland' 'hyprland' 'jq')
+makedepends=('git' 'rust' 'wayland-protocols')
+optdepends=('mpvpaper: animated (gif/mp4/webm) wallpapers'
+            'ffmpegthumbnailer: fast video poster extraction'
+            'ffmpeg: fallback video poster extraction')
 optdepends=('mpvpaper: animated (gif/mp4/webm) wallpapers')
 provides=('walleclipse')
 conflicts=('walleclipse')
@@ -26,16 +29,16 @@ pkgver() {
 }
 
 build() {
-  cmake -B build -S WallEclipse \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr
-  cmake --build build
+  cd WallEclipse
+  cargo build --release --locked
 }
 
 check() {
-  ctest --test-dir build
+  cd WallEclipse
+  cargo test --locked
 }
 
 package() {
-  DESTDIR="$pkgdir" cmake --install build
+  cd WallEclipse
+  install -Dm755 target/release/walleclipse "$pkgdir/usr/bin/walleclipse"
 }

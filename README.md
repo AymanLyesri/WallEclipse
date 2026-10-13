@@ -17,14 +17,13 @@ wallpapers once at startup into RAM (threadpool) and switches with a local
 ## Layout
 
 ```
-CMakeLists.txt          C++20, wayland-scanner codegen
-protocols/              vendored wlr-layer-shell-unstable-v1.xml
-third_party/stb_image.h jpg/png decoder (webp via system libwebp)
-include/walleclipse/   ConfigStore, ImageLoader, Preloader,
-src/                    WaylandBackend, HyprListener, MediaDelegate, Ipc
-tests/                  CTest unit tests (no compositor needed)
+Cargo.toml              workspace root (binary `walleclipse`, lib `walleclipse_rs`)
+src/                    ConfigStore, ImageLoader, Preloader, WaylandBackend,
+                        HyprListener, MediaDelegate, VideoPoster, Util, Ipc
+tests/                  `cargo test` integration tests (no compositor needed)
+examples/microbench.rs  decode+scale microbench used for COMPARISON.md
+COMPARISON.md           C++ vs Rust numbers (historical record)
 config/defaults.conf    seed template (w-1=..w-10=), copied from ArchEclipse
-docs/superpowers/plans/ implementation plan
 ```
 
 ## Config merge
@@ -43,22 +42,24 @@ Or let the daemon seed empty slots from `config/defaults.conf` automatically.
 ## Build
 
 ```sh
-cmake -S . -B build && cmake --build build
-ctest --test-dir build
+cargo build --release
+cargo test
 ```
 
-Deps: `wayland-client`, `wlr-protocols` not required (vendored),
-`libpng`, `libjpeg`, `libwebp`, `wayland-scanner`.
+Always run the **release** binary — debug builds are ~12x slower at
+decode/scale and cannot hold the 120fps transition cadence.
+Deps: a recent stable Rust toolchain, system `ffmpegthumbnailer`/`ffmpeg`
+(poster extraction), `mpvpaper` (animated wallpapers), `hyprland`, `jq`.
 
 ## Run
 
 ```sh
-./build/walleclipse                  # daemon: preload-all, then Hyprland events
-./build/walleclipse --once DP-2 ~/wall.jpg   # smoke test one render
-./build/walleclipse set DP-2 3 ~/wall.jpg
-./build/walleclipse preload ~/wall.jpg
-./build/walleclipse reload   # re-read config + re-apply current
-./build/walleclipse list
+./target/release/walleclipse                  # daemon: preload-all, then Hyprland events
+./target/release/walleclipse --once DP-2 ~/wall.jpg   # smoke test one render
+./target/release/walleclipse set DP-2 3 ~/wall.jpg
+./target/release/walleclipse preload ~/wall.jpg
+./target/release/walleclipse reload   # re-read config + re-apply current
+./target/release/walleclipse list
 ```
 
 Logs: `/tmp/walleclipse.log`. IPC: `${XDG_CACHE_HOME:-~/.cache}/walleclipse.sock`.
@@ -71,5 +72,4 @@ Logs: `/tmp/walleclipse.log`. IPC: `${XDG_CACHE_HOME:-~/.cache}/walleclipse.sock
 
 ## License
 
-GPL-3.0-only, see [LICENSE](LICENSE). Vendored `third_party/stb_image.h` is
-MIT-licensed (compatible, notice preserved in-file).
+GPL-3.0-only, see [LICENSE](LICENSE).

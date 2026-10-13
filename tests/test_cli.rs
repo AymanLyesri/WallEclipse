@@ -1,7 +1,7 @@
 use std::process::Command;
 
 fn bin() -> String {
-    env!("CARGO_BIN_EXE_walleclipse-rs").to_string()
+    env!("CARGO_BIN_EXE_walleclipse").to_string()
 }
 
 #[test]

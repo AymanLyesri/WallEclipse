@@ -1,22 +1,9 @@
 # Build outputs
+/target/
 build/
-cmake-build-*/
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
 *.o
 *.a
 *.so
-# Built binary (root-anchored: bare `walleclipse` would also ignore include/walleclipse/)
-/walleclipse
-build.ninja
-.ninja_*
-
-# Generated Wayland protocol code
-src/protocol-*.c
-src/protocol-*.h
-build/generated/
 
 # Compile DB / IDE
 compile_commands.json
@@ -38,17 +25,9 @@ config/transition
 *.sock
 /tmp/walleclipse*.log
 
-# Tests build artifacts
-tests/build/
-Testing/
-CTestTestfile.cmake
-DartConfiguration.tcl
-
 # Python caches (if any tooling)
 __pycache__/
 *.pyc
 
 
 docs/
-# Rust port build outputs
-rust/target/

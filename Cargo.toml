@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "walleclipse-rs"
+name = "walleclipse"
 path = "src/main.rs"
 
 [lib]
