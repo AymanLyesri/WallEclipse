@@ -86,19 +86,18 @@ pub fn play_on_monitor(monitor: &str, path: &str) -> bool {
     true
 }
 
-/// Run the wal-theme hook detached (parity with hyprpaper.sh). No-op
-/// when the hook script is missing or not executable.
+/// Run the theme hook detached (parity with hyprpaper.sh). No-op until the
+/// coloreclipse package is installed.
 pub fn apply_theme(wallpaper: &str) {
     use std::os::unix::fs::PermissionsExt;
-    let home = std::env::var("HOME").unwrap_or_default();
-    let script = format!("{home}/.config/hypr/theme/scripts/wal-theme.sh");
-    let executable = std::fs::metadata(&script)
+    let binary = "/usr/bin/coloreclipse";
+    let executable = std::fs::metadata(binary)
         .map(|m| m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false);
     if !executable {
         return;
     }
-    spawn_detached(&[&script, wallpaper]);
+    spawn_detached(&[binary, "wal", wallpaper]);
 }
 
 /// True when `hyprctl layers` output (one namespace per line) lists a

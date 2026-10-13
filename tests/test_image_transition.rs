@@ -161,7 +161,6 @@ fn load_missing_returns_none() {
 
 #[test]
 fn render_into_matches_render_for_all_effects() {
-    use walleclipse_rs::transition::TransitionEffect;
     let (w, h) = (64u32, 48u32);
     let n = w as usize * h as usize * 4;
     let old = vec![10u8; n];
@@ -183,7 +182,6 @@ fn render_into_matches_render_for_all_effects() {
 
 #[test]
 fn reused_buffers_produce_correct_frame_sequence() {
-    use walleclipse_rs::transition::TransitionEffect;
     let (w, h) = (64u32, 48u32);
     let n = w as usize * h as usize * 4;
     let old = vec![10u8; n];
