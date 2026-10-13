@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use walleclipse_rs::hypr::{HyprListener, SwitchAction, decide, is_refresh_event, parse_snapshot_lines};
@@ -111,6 +111,81 @@ fn listener_apply_current_paints_and_note_shown_tracks_static() {
     // Out-of-band SET bypass: note_shown keeps animated-restore state accurate.
     listener.note_shown("DP-1", "/v/clip.mp4");
     listener.note_shown("DP-1", "/s/other.jpg");
+}
+
+#[test]
+fn run_reports_missing_hypr_socket_via_on_error() {
+    let _guard = ipc_lock();
+    let prev_runt = std::env::var("XDG_RUNTIME_DIR").ok();
+    let prev_sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    unsafe {
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
+    }
+
+    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors2 = Arc::clone(&errors);
+    let listener = HyprListener::new(
+        Arc::new(Vec::new),
+        Arc::new(|_: &str, _: i32| None),
+        Arc::new(|_: &str, _: &str, _: SlideDir, _: i32, _: i32| {}),
+        Arc::new(|_: &str, _: &str, _: SlideDir, _: i32, _: i32| {}),
+    )
+    .with_on_error(Arc::new(move |where_: &str, msg: &str| {
+        errors2
+            .lock()
+            .unwrap()
+            .push((where_.to_string(), msg.to_string()));
+    }));
+    // Returns (no socket to block on) and reports via on_error.
+    listener.run();
+    let got = errors.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "expected one on_error call, got {got:?}");
+    assert_eq!(got[0].0, "socket");
+    assert!(
+        got[0].1.contains("XDG_RUNTIME_DIR"),
+        "message: {:?}",
+        got[0].1
+    );
+
+    match prev_runt {
+        Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+        None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+    }
+    match prev_sig {
+        Some(v) => unsafe { std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", v) },
+        None => unsafe { std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE") },
+    }
+}
+
+#[test]
+fn show_callback_calling_note_shown_does_not_deadlock() {
+    // Re-entrancy scenario: a show callback calling note_shown (as IPC
+    // `set` does out-of-band). The old MutexGuard-held-across-callbacks
+    // shape deadlocked here; callbacks now run lock-free.
+    let listener = Arc::new_cyclic(|weak: &Weak<HyprListener>| {
+        let w = weak.clone();
+        HyprListener::new(
+            Arc::new(move || vec![("DP-1".to_string(), 1)]),
+            Arc::new(|_: &str, _: i32| Some("/s/bg.jpg".to_string())),
+            Arc::new(move |mon: &str, path: &str, _: SlideDir, _: i32, _: i32| {
+                if let Some(l) = w.upgrade() {
+                    l.note_shown(mon, path);
+                }
+            }),
+            Arc::new(|_: &str, _: &str, _: SlideDir, _: i32, _: i32| {}),
+        )
+    });
+    let l2 = Arc::clone(&listener);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        l2.apply_current();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("deadlock: apply_current with re-entrant note_shown did not return");
+    // State converged on the shown wallpaper despite the interleaved write.
+    listener.note_shown("probe", "/s/x.jpg");
 }
 
 #[test]

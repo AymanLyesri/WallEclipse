@@ -124,6 +124,7 @@ pub struct HyprListener {
     show_static: Arc<dyn Fn(&str, &str, SlideDir, i32, i32) + Send + Sync>,
     show_animated: Arc<dyn Fn(&str, &str, SlideDir, i32, i32) + Send + Sync>,
     on_info: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
+    on_error: Option<Arc<dyn Fn(&str, &str) + Send + Sync>>,
     state: Mutex<ListenerState>,
 }
 
@@ -132,6 +133,17 @@ struct ListenerState {
     last_workspace: HashMap<String, i32>,
     current_wallpaper: HashMap<String, String>,
     last_static_wallpaper: HashMap<String, String>,
+}
+
+/// Per-monitor update computed lock-free, applied under re-lock in
+/// iteration order (matches the C++ sequential semantics).
+struct Pending {
+    monitor: String,
+    ws: i32,
+    /// Path now displayed (`None` = unchanged, i.e. Skip).
+    current: Option<String>,
+    /// New last-static path (`Some` only when a static show updates it).
+    last_static: Option<String>,
 }
 
 fn opt_of(map: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -151,6 +163,7 @@ impl HyprListener {
             show_static,
             show_animated,
             on_info: None,
+            on_error: None,
             state: Mutex::new(ListenerState::default()),
         }
     }
@@ -163,8 +176,22 @@ impl HyprListener {
         self
     }
 
+    pub fn with_on_error(
+        mut self,
+        on_error: Arc<dyn Fn(&str, &str) + Send + Sync>,
+    ) -> Self {
+        self.on_error = Some(on_error);
+        self
+    }
+
     fn info(&self, where_: &str, msg: &str) {
         if let Some(f) = &self.on_info {
+            f(where_, msg);
+        }
+    }
+
+    fn error(&self, where_: &str, msg: &str) {
+        if let Some(f) = &self.on_error {
             f(where_, msg);
         }
     }
@@ -175,11 +202,24 @@ impl HyprListener {
             self.info("change_wallpaper", "empty monitor snapshot; keeping previous");
             return;
         }
-        let mut state = self.state.lock().unwrap();
+        // Snapshot state, then decide and invoke callbacks lock-free: a
+        // slow render never blocks note_shown, and a re-entrant callback
+        // (e.g. show -> note_shown, as IPC `set` does) cannot deadlock.
+        // Local maps are seeded from the snapshot and updated as we go,
+        // so even a duplicate-monitor snapshot behaves sequentially.
+        let (mut last_ws, mut current, mut last_static) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.last_workspace.clone(),
+                state.current_wallpaper.clone(),
+                state.last_static_wallpaper.clone(),
+            )
+        };
+        let mut pending: Vec<Pending> = Vec::new();
         let mut seen = HashSet::new();
         for (monitor, ws) in &pairs {
             seen.insert(monitor.clone());
-            if state.last_workspace.get(monitor) == Some(ws) {
+            if last_ws.get(monitor) == Some(ws) {
                 continue; // unchanged workspace
             }
             let target = (self.lookup)(monitor, *ws);
@@ -189,49 +229,76 @@ impl HyprListener {
                     &format!("No wallpaper config for '{monitor}' workspace {ws}"),
                 );
             }
-            let from_ws = state.last_workspace.get(monitor).copied();
+            let from_ws = last_ws.get(monitor).copied();
             let dir: SlideDir = slide_dir_for_workspaces(from_ws, *ws);
             let from_id = from_ws.unwrap_or(*ws);
+            let mut cur: Option<String> = None;
+            let mut sta: Option<String> = None;
             match decide(
-                &opt_of(&state.current_wallpaper, monitor),
+                &opt_of(&current, monitor),
                 &target,
-                &opt_of(&state.last_static_wallpaper, monitor),
+                &opt_of(&last_static, monitor),
             ) {
                 SwitchAction::Skip => {}
                 SwitchAction::ShowStatic => {
                     let t = target.clone().unwrap();
                     (self.show_static)(monitor, &t, dir, from_id, *ws);
-                    state.last_static_wallpaper.insert(monitor.clone(), t.clone());
-                    state.current_wallpaper.insert(monitor.clone(), t);
+                    sta = Some(t.clone());
+                    cur = Some(t);
                 }
                 SwitchAction::ShowAnimated => {
                     let t = target.clone().unwrap();
                     (self.show_animated)(monitor, &t, dir, from_id, *ws);
-                    state.current_wallpaper.insert(monitor.clone(), t);
+                    cur = Some(t);
                 }
                 SwitchAction::RestoreStatic => {
                     // Target empty: re-show the last static path. The
                     // mapping still points at the video; record what's
                     // displayed so returning to it re-spawns the player.
-                    let ls = state.last_static_wallpaper.get(monitor).cloned().unwrap();
+                    let ls = last_static.get(monitor).cloned().unwrap();
                     (self.show_static)(monitor, &ls, dir, from_id, *ws);
-                    state.current_wallpaper.insert(monitor.clone(), ls);
+                    cur = Some(ls);
                 }
             }
-            state.last_workspace.insert(monitor.clone(), *ws);
+            if let Some(s) = &sta {
+                last_static.insert(monitor.clone(), s.clone());
+            }
+            if let Some(c) = &cur {
+                current.insert(monitor.clone(), c.clone());
+            }
+            last_ws.insert(monitor.clone(), *ws);
+            pending.push(Pending {
+                monitor: monitor.clone(),
+                ws: *ws,
+                current: cur,
+                last_static: sta,
+            });
         }
-        // Prune disconnected monitors so a reconnect forces a repaint
+        // Re-lock: apply the computed updates in order, then prune
+        // disconnected monitors so a reconnect forces a repaint
         // instead of being skipped as "unchanged workspace".
-        let gone: Vec<String> = state
-            .last_workspace
-            .keys()
-            .filter(|m| !seen.contains(*m))
-            .cloned()
-            .collect();
-        for m in gone {
-            state.last_workspace.remove(&m);
-            state.current_wallpaper.remove(&m);
-            state.last_static_wallpaper.remove(&m);
+        {
+            let mut state = self.state.lock().unwrap();
+            for p in pending {
+                if let Some(s) = p.last_static {
+                    state.last_static_wallpaper.insert(p.monitor.clone(), s);
+                }
+                if let Some(c) = p.current {
+                    state.current_wallpaper.insert(p.monitor.clone(), c);
+                }
+                state.last_workspace.insert(p.monitor, p.ws);
+            }
+            let gone: Vec<String> = state
+                .last_workspace
+                .keys()
+                .filter(|m| !seen.contains(*m))
+                .cloned()
+                .collect();
+            for m in gone {
+                state.last_workspace.remove(&m);
+                state.current_wallpaper.remove(&m);
+                state.last_static_wallpaper.remove(&m);
+            }
         }
     }
 
@@ -256,12 +323,26 @@ impl HyprListener {
     }
 
     /// Blocking event loop (returns on socket EOF/error or when the
-    /// Hyprland runtime env is missing).
+    /// Hyprland runtime env is missing; failures report via on_error,
+    /// mirroring the C++ `onError("socket", ...)` call sites).
     pub fn run(&self) {
         self.apply_current();
-        let Some(sock) = socket2_path() else { return };
-        let Ok(stream) = std::os::unix::net::UnixStream::connect(&sock) else {
+        let Some(sock) = socket2_path() else {
+            self.error(
+                "socket",
+                "XDG_RUNTIME_DIR/HYPRLAND_INSTANCE_SIGNATURE not set",
+            );
             return;
+        };
+        // Rust builds the socket inside `connect`, and `BufReader`
+        // construction is infallible, so one site covers the C++
+        // socket()/connect()/fdopen() failures.
+        let stream = match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(s) => s,
+            Err(e) => {
+                self.error("socket", &format!("connect {sock}: {e}"));
+                return;
+            }
         };
         let reader = std::io::BufReader::new(stream);
         let mut last_run = Instant::now() - Duration::from_secs(10);
