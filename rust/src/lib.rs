@@ -1,5 +1,7 @@
 pub mod config;
+pub mod hypr;
 pub mod image;
+pub mod ipc;
 pub mod media;
 pub mod poster;
 pub mod preloader;
