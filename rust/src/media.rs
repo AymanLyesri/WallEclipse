@@ -1,7 +1,7 @@
 //! mpvpaper hand-off for animated wallpapers (port of
 //! `MediaDelegate.hpp/cpp`, mirroring wallpaper-daemon/mpvpaper.sh +
-//! hyprpaper.sh kill semantics): only mpvpaper instances whose cmdline
-//! mentions the monitor are killed.
+//! hyprpaper.sh kill semantics): only mpvpaper instances whose argv lists
+//! the monitor as an exact token are killed.
 
 use crate::util::{exec_capture, spawn_detached, split_lines, trim_ws};
 use std::time::{Duration, Instant};
@@ -10,9 +10,22 @@ fn proc_read(pid: u32, file: &str) -> Vec<u8> {
     std::fs::read("/proc/".to_owned() + &pid.to_string() + file).unwrap_or_default()
 }
 
+/// True when a `/proc/<pid>/cmdline` blob passes `monitor` as an exact
+/// argv token. `/proc` cmdlines are NUL-separated argv, so splitting on
+/// `'\0'` and comparing whole tokens never confuses `DP-1` with `DP-11`
+/// (the C++ `stopForMonitor` uses substring `.find()`, which does).
+/// Pure helper, unit-tested.
+pub fn cmdline_lists_monitor(cmdline: &str, monitor: &str) -> bool {
+    if monitor.is_empty() {
+        return false;
+    }
+    cmdline.split('\0').any(|tok| tok == monitor)
+}
+
 /// Kill stale mpvpaper processes for a monitor (best-effort): scan
-/// `/proc` for tasks whose `comm` is `mpvpaper` and whose cmdline
-/// mentions the monitor, then SIGTERM each via `/bin/kill`.
+/// `/proc` for tasks whose `comm` is `mpvpaper` and whose argv lists the
+/// monitor as an exact token, then SIGTERM each via `/bin/kill`
+/// (absolute path: PATH-independent).
 pub fn stop_for_monitor(monitor: &str) {
     let proc = match std::fs::read_dir("/proc") {
         Ok(d) => d,
@@ -32,8 +45,8 @@ pub fn stop_for_monitor(monitor: &str) {
         }
         let raw = proc_read(pid, "/cmdline");
         let cmdline = String::from_utf8_lossy(&raw);
-        if cmdline.contains(monitor) {
-            let _ = std::process::Command::new("kill")
+        if cmdline_lists_monitor(&cmdline, monitor) {
+            let _ = std::process::Command::new("/bin/kill")
                 .arg("-TERM")
                 .arg(pid.to_string())
                 .stdin(std::process::Stdio::null())

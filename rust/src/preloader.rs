@@ -52,7 +52,7 @@ impl Preloader {
             return;
         }
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
             if cache.contains_key(path) {
                 return;
             }
@@ -66,7 +66,10 @@ impl Preloader {
             img = Self::decode_static(path);
         }
         if let Some(img) = img {
-            self.cache.write().unwrap().insert(path.to_string(), img);
+            self.cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_string(), img);
         }
     }
 
@@ -77,7 +80,7 @@ impl Preloader {
             return;
         }
         {
-            let posters = self.posters.read().unwrap();
+            let posters = self.posters.read().unwrap_or_else(|e| e.into_inner());
             if posters.contains_key(path) {
                 return;
             }
@@ -89,7 +92,10 @@ impl Preloader {
             img = poster::load(path).map(Arc::new);
         }
         if let Some(img) = img {
-            self.posters.write().unwrap().insert(path.to_string(), img);
+            self.posters
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_string(), img);
         }
     }
 
@@ -141,16 +147,53 @@ impl Preloader {
 
     /// Cached static wallpaper, or [`None`] on miss.
     pub fn get(&self, path: &str) -> Option<Arc<DecodedImage>> {
-        self.cache.read().unwrap().get(path).cloned()
+        self.cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned()
     }
 
     /// Cached video poster, or [`None`] on miss.
     pub fn get_poster(&self, path: &str) -> Option<Arc<DecodedImage>> {
-        self.posters.read().unwrap().get(path).cloned()
+        self.posters
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned()
     }
 
     /// Total entries across both caches.
     pub fn size(&self) -> usize {
-        self.cache.read().unwrap().len() + self.posters.read().unwrap().len()
+        self.cache.read().unwrap_or_else(|e| e.into_inner()).len()
+            + self.posters.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A poisoned lock must degrade, not panic: recover the guard via
+    /// `into_inner()` so `get`/`size` keep working (fail-soft spirit —
+    /// a wallpaper cache must never wedge a workspace switch).
+    #[test]
+    fn poisoned_locks_degrade_instead_of_panicking() {
+        let pre = Preloader::new(1);
+        // Poison both locks by panicking while holding each write guard.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cache = pre.cache.write().unwrap_or_else(|e| e.into_inner());
+            let _posters = pre.posters.write().unwrap_or_else(|e| e.into_inner());
+            panic!("intentional poison for test");
+        }));
+        assert!(poisoned.is_err());
+        // Reads recover instead of panicking.
+        assert!(pre.get("anything").is_none());
+        assert!(pre.get_poster("anything.mp4").is_none());
+        assert_eq!(pre.size(), 0);
+        // Writes through the recovered guards work as well.
+        pre.preload_one("/nonexistent/x.png");
+        pre.preload_poster_one("/nonexistent/y.mp4");
+        assert_eq!(pre.size(), 0);
     }
 }

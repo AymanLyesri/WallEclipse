@@ -77,3 +77,19 @@ fn poster_failure_returns_none_without_panic() {
     let bogus = tmpdir("poster-fail").join("missing-video.mp4");
     assert!(poster::load(&bogus.to_string_lossy()).is_none());
 }
+
+#[test]
+fn stop_selects_exact_monitor_token() {
+    // Realistic /proc cmdline blobs (NUL-separated argv) for players on
+    // DP-1 and DP-11: selector for DP-1 must not match the DP-11 player.
+    let dp1 = "mpvpaper\0-o\0no-audio --loop --fs\0DP-1\0/wall.mp4\0";
+    let dp11 = "mpvpaper\0-o\0no-audio --loop --fs\0DP-11\0/other.mp4\0";
+    assert!(media::cmdline_lists_monitor(dp1, "DP-1"));
+    assert!(!media::cmdline_lists_monitor(dp11, "DP-1"));
+    assert!(media::cmdline_lists_monitor(dp11, "DP-11"));
+    assert!(!media::cmdline_lists_monitor(dp1, "DP-11"));
+    // No partial-token or empty-monitor matches.
+    assert!(!media::cmdline_lists_monitor(dp1, "DP"));
+    assert!(!media::cmdline_lists_monitor(dp1, ""));
+    assert!(!media::cmdline_lists_monitor("", "DP-1"));
+}
