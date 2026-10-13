@@ -89,7 +89,8 @@ impl ConfigStore {
             Err(_) => return out,
         };
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            // metadata (not file_type) follows symlinks, like C++ `e.is_directory(ec)`.
+            if fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false) {
                 out.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -205,10 +206,11 @@ fn parse_wallpaper_line(line: &str) -> Option<(i32, String)> {
     Some((ws, rest[eq + 1..].to_string()))
 }
 
-/// C++ `std::stoi` prefix semantics: skip leading spaces, optional sign,
-/// then run of digits (at least one digit required).
+/// C++ `std::stoi` prefix semantics: skip leading whitespace (all ASCII
+/// whitespace, like `isspace`), optional sign, then run of digits (at
+/// least one digit required).
 fn stoi_prefix(s: &str) -> Option<i32> {
-    let s = s.trim_start_matches(' ');
+    let s = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
     let (neg, digits) = match s.strip_prefix('-') {
         Some(d) => (true, d),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
@@ -227,4 +229,47 @@ fn stoi_prefix(s: &str) -> Option<i32> {
         val = -val;
     }
     i32::try_from(val).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stoi_prefix_skips_all_ascii_whitespace() {
+        // C++ std::stoi skips isspace (space, \t, \n, \v, \f, \r) before
+        // the optional sign + digits.
+        assert_eq!(
+            parse_wallpaper_line("w-\t3=/x.jpg"),
+            Some((3, "/x.jpg".to_string()))
+        );
+        assert_eq!(
+            parse_wallpaper_line("w- \t 4=/y.jpg"),
+            Some((4, "/y.jpg".to_string()))
+        );
+        assert_eq!(
+            parse_wallpaper_line("w- 5=/z.jpg"),
+            Some((5, "/z.jpg".to_string()))
+        );
+        assert_eq!(parse_wallpaper_line("w-\t=x.jpg"), None);
+    }
+
+    #[test]
+    fn monitors_follows_symlinked_dirs() {
+        let base = std::env::temp_dir().join(format!(
+            "walleclipse-rust-test-monitors-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real-DP-1");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link-DP-2");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = ConfigStore::new(&base);
+        let mons = store.monitors();
+        assert!(mons.contains(&"real-DP-1".to_string()), "{mons:?}");
+        assert!(mons.contains(&"link-DP-2".to_string()), "{mons:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

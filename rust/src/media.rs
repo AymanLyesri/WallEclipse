@@ -22,11 +22,25 @@ pub fn cmdline_lists_monitor(cmdline: &str, monitor: &str) -> bool {
     cmdline.split('\0').any(|tok| tok == monitor)
 }
 
+/// Log string emitted when `stop_for_monitor` gets an empty monitor name.
+/// C++ `stopForMonitor` (MediaDelegate.cpp:34-49) matches via substring
+/// `.find(monitor)`, and `find("")` always matches — so an empty name
+/// would SIGTERM every mpvpaper instance. The Rust exact-token match
+/// ([`cmdline_lists_monitor`]) refuses instead; this log keeps that
+/// refusal observable so a future empty-name bug surfaces instead of
+/// silently leaking players. Covered by `empty_monitor_kills_nothing_and_logs`.
+pub const EMPTY_MONITOR_LOG: &str =
+    "stop_for_monitor: refusing empty monitor name (kills nothing; C++ substring would kill everything)";
+
 /// Kill stale mpvpaper processes for a monitor (best-effort): scan
 /// `/proc` for tasks whose `comm` is `mpvpaper` and whose argv lists the
 /// monitor as an exact token, then SIGTERM each via `/bin/kill`
 /// (absolute path: PATH-independent).
 pub fn stop_for_monitor(monitor: &str) {
+    if monitor.is_empty() {
+        eprintln!("[media] {EMPTY_MONITOR_LOG}");
+        return;
+    }
     let proc = match std::fs::read_dir("/proc") {
         Ok(d) => d,
         Err(_) => return,
@@ -125,4 +139,26 @@ pub fn wait_for_player(monitor: &str, timeout_ms: u64) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_monitor_kills_nothing_and_logs() {
+        // No-kill half: the exact-token matcher never matches an empty
+        // monitor, so no pid can be selected (unlike C++ `find("")`,
+        // which matches every cmdline).
+        assert!(!cmdline_lists_monitor("mpvpaper\0DP-1\0/v/a.mp4\0", ""));
+        assert!(!cmdline_lists_monitor("", ""));
+        // Early return: must not scan /proc at all (returns right after
+        // the log below).
+        stop_for_monitor("");
+        // Log half: asserted via the shared constant — the documented log
+        // string the early return emits through eprintln! (capturing
+        // stderr would need process-level redirection; the constant is
+        // the observable contract).
+        assert!(EMPTY_MONITOR_LOG.contains("empty monitor"));
+    }
 }

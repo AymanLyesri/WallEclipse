@@ -142,17 +142,70 @@ pub fn serve(h: Handlers) -> bool {
 
 /// One-shot client: send lines, return server reply.
 pub fn call(payload: &str) -> String {
+    call_at(std::path::Path::new(&socket_path()), payload)
+}
+
+fn call_at(sock: &std::path::Path, payload: &str) -> String {
     use std::os::unix::net::UnixStream;
-    let Ok(mut fd) = UnixStream::connect(socket_path()) else {
+    let Ok(mut fd) = UnixStream::connect(sock) else {
         return "ERR daemon not running\n".to_string();
     };
     let mut msg = payload.to_string();
     if !msg.ends_with('\n') {
         msg.push('\n');
     }
+    // Mirror C++ `Ipc::call` (Ipc.cpp:114-133): `"ERR no socket"` is
+    // returned only when `socket()` itself fails. Every later-stage
+    // failure (connect refused = dead daemon, write to a dead peer, ...)
+    // must read as daemon-down so scripts see the `ERR` prefix and exit
+    // 1. (C++ ignores the write result and surfaces whatever reply
+    // arrives — possibly empty, which `runClient` would mistake for
+    // success; the daemon string is the observable-behavior equivalent.)
     if fd.write_all(msg.as_bytes()).is_err() {
-        return "ERR no socket\n".to_string();
+        return "ERR daemon not running\n".to_string();
     }
     let _ = fd.shutdown(std::net::Shutdown::Write);
     read_all(&fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// Write-failure path (server accepted, then vanished: dead daemon)
+    /// must read as daemon-down — not `"ERR no socket"` (which C++
+    /// reserves for `socket()` failure, Ipc.cpp:115-117) and not an empty
+    /// reply (which `run_client` would mistake for success, exit 0).
+    /// Uses an isolated socket path under a temp dir, never the live one.
+    #[test]
+    fn write_failure_reports_daemon_not_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "walleclipse-rust-test-ipc-writefail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("walleclipse.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // Server: accept one connection, then close it immediately, so
+        // the client's write hits a dead peer (EPIPE; SIGPIPE is ignored
+        // by the Rust runtime, so `write_all` returns `Err`).
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            drop(conn);
+        });
+        // Oversized payload: early bytes may still fit the socket buffers
+        // before the RST lands, so `write_all` needs many chunks to
+        // deterministically observe EPIPE. (A single small write could
+        // succeed into the buffer and then hang in `read_all`.)
+        // `accept` blocks until our connect arrives and the close always
+        // follows, so one attempt deterministically hits the dead peer:
+        // the 2MB can never fully buffer with no reader.
+        let big = "PING ".to_string() + &"x".repeat(2 * 1024 * 1024);
+        let reply = call_at(&sock, &big);
+        assert_eq!(reply, "ERR daemon not running\n");
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

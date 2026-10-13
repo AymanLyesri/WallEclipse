@@ -203,6 +203,16 @@ fn show_animated_now(
         // Static -> animated: slide to the video's poster, then hand off.
         if let Some(poster) = poster_for(&ctx.preloader, path) {
             ctx.backend.set_wallpaper_dir(mon, poster, dir);
+        } else {
+            // Poster extraction failed: C++ (main.cpp:294-298, `if (auto
+            // poster = posterFor(path))`) skips the slide here too and
+            // hands off anyway — the hide below blanks until the player's
+            // first frame. Behavior kept identical; log so the missing
+            // poster surfaces instead of a silent black cut.
+            log_line(
+                "change_wallpaper",
+                &format!("cannot extract poster for '{path}' — handing off without poster frame"),
+            );
         }
     } else if {
         let prev = get_shown(&ctx.shown, mon);
@@ -217,6 +227,14 @@ fn show_animated_now(
                 media::stop_for_monitor(mon); // reveal old poster
                 ctx.backend.set_wallpaper_dir(mon, new, dir);
             }
+        } else {
+            // Same C++ parity (main.cpp:299-307: both posters required):
+            // missing poster(s) skip the poster->poster slide and the
+            // handoff below still hides. Log for observability.
+            log_line(
+                "change_wallpaper",
+                &format!("cannot extract poster for '{path}' — handing off without poster frame"),
+            );
         }
     }
     handoff_to_video(&ctx.backend, mon, path);
@@ -512,5 +530,30 @@ mod tests {
     fn help_uses_argv0() {
         let h = help_text("walleclipse-rs");
         assert!(h.contains("walleclipse-rs set MON WS PATH"));
+    }
+
+    #[test]
+    fn missing_poster_returns_none_for_handoff_log_path() {
+        // Isolated cache dir: poster extraction probes the disk cache and
+        // shells out to ffmpegthumbnailer/ffmpeg (both fail fast on
+        // missing input). NEVER the live ~/.cache.
+        let dir = std::env::temp_dir().join(format!(
+            "walleclipse-rust-test-poster-none-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("XDG_CACHE_HOME").ok();
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &dir) };
+        let pre = Preloader::new(1);
+        // Extraction of a nonexistent video fails -> None. show_animated_now
+        // keeps the C++ behavior here (main.cpp:292-312: null poster skips
+        // the slide, handoff hides anyway) and logs "cannot extract poster".
+        assert!(poster_for(&pre, "/nonexistent/no-poster-here.mp4").is_none());
+        match prev {
+            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
