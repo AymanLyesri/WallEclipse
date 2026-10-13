@@ -32,6 +32,22 @@ fn valid_size(w: u32, h: u32) -> bool {
     w > 0 && h > 0 && w <= 16384 && h <= 16384
 }
 
+/// Longest side kept in the preload cache. Wallpapers bigger than this
+/// (e.g. 8K files on a 1080p panel) cost full-res RAM without any visible
+/// benefit: cover-fit downscales them for display anyway. 3840 covers 4K
+/// outputs; bigger panels re-decode on demand via the cache-miss path.
+pub const MAX_CACHED_SIDE: u32 = 3840;
+
+/// Shrink `img` (aspect-preserving, downscale-only) so its longest side
+/// fits [`MAX_CACHED_SIDE`]. Uses the `image` crate's thumbnail filter.
+fn apply_size_cap(img: image::DynamicImage) -> image::DynamicImage {
+    if img.width().max(img.height()) > MAX_CACHED_SIDE {
+        img.thumbnail(MAX_CACHED_SIDE, MAX_CACHED_SIDE)
+    } else {
+        img
+    }
+}
+
 /// Decode jpg/png/webp into 8-bit RGBA.
 /// Returns `None` when the file is missing or undecodable — callers keep
 /// the previous wallpaper up and log, never black-screen.
@@ -40,7 +56,8 @@ pub fn load_image(path: &str) -> Option<DecodedImage> {
     if data.is_empty() || data.len() > (128 << 20) {
         return None;
     }
-    let img = image::load_from_memory(&data).ok()?.to_rgba8();
+    let img = image::load_from_memory(&data).ok()?;
+    let img = apply_size_cap(img).to_rgba8();
     let (width, height) = (img.width(), img.height());
     if !valid_size(width, height) {
         return None;
@@ -106,4 +123,24 @@ pub fn scale_cover_argb(src: &DecodedImage, dst_w: u32, dst_h: u32) -> Vec<u8> {
         }
     }
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::DynamicImage;
+
+    #[test]
+    fn size_cap_leaves_small_images_untouched() {
+        let img = DynamicImage::new_rgba8(800, 600);
+        let capped = apply_size_cap(img);
+        assert_eq!((capped.width(), capped.height()), (800, 600));
+    }
+
+    #[test]
+    fn size_cap_limits_long_side_preserving_aspect() {
+        let img = DynamicImage::new_rgba8(5000, 2500);
+        let capped = apply_size_cap(img);
+        assert_eq!((capped.width(), capped.height()), (3840, 1920));
+    }
 }

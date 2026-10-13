@@ -51,7 +51,22 @@ pub trait TransitionEffect {
     fn duration_ms(&self) -> i32;
     /// Eased progress for linear `t` in [0,1].
     fn eased(&self, t: f64) -> f64;
-    /// Composite one frame; `progress` is linear [0,1], eased internally.
+    /// Composite one frame into `out` (`w*h*4` bytes, reused across
+    /// frames); `progress` is linear [0,1], eased internally.
+    #[allow(clippy::too_many_arguments)]
+    fn render_into(
+        &self,
+        old_frame: &[u8],
+        new_frame: &[u8],
+        out: &mut [u8],
+        w: u32,
+        h: u32,
+        progress: f64,
+        dir: SlideDir,
+    );
+    /// Composite one frame; convenience wrapper allocating the buffer.
+    /// The animation loop uses [`TransitionEffect::render_into`] with
+    /// reused buffers instead (no per-frame allocation churn).
     fn render(
         &self,
         old_frame: &[u8],
@@ -60,7 +75,11 @@ pub trait TransitionEffect {
         h: u32,
         progress: f64,
         dir: SlideDir,
-    ) -> Vec<u8>;
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; w as usize * h as usize * 4];
+        self.render_into(old_frame, new_frame, &mut out, w, h, progress, dir);
+        out
+    }
 }
 
 struct SlidingTransition;
@@ -74,34 +93,38 @@ impl TransitionEffect for SlidingTransition {
     fn eased(&self, t: f64) -> f64 {
         ease_out_cubic(t)
     }
-    fn render(
+    fn render_into(
         &self,
         old_frame: &[u8],
         new_frame: &[u8],
+        out: &mut [u8],
         w: u32,
         h: u32,
         progress: f64,
         dir: SlideDir,
-    ) -> Vec<u8> {
+    ) {
         if dir == SlideDir::None || progress >= 1.0 {
-            return new_frame.to_vec();
+            out.copy_from_slice(new_frame);
+            return;
         }
         if progress <= 0.0 {
-            return old_frame.to_vec();
+            out.copy_from_slice(old_frame);
+            return;
         }
         let split = (self.eased(progress) * f64::from(w)) as u32;
         if split == 0 {
-            return old_frame.to_vec();
+            out.copy_from_slice(old_frame);
+            return;
         }
         if split >= w
             || old_frame.len() != new_frame.len()
             || old_frame.len() != w as usize * h as usize * 4
         {
-            return new_frame.to_vec();
+            out.copy_from_slice(new_frame);
+            return;
         }
         // Row-based composite: one contiguous old run + one contiguous
         // new run per row.
-        let mut out = vec![0u8; old_frame.len()];
         let row_bytes = w as usize * 4;
         let new_bytes = split as usize * 4;
         let old_bytes = row_bytes - new_bytes;
@@ -119,7 +142,6 @@ impl TransitionEffect for SlidingTransition {
                 d_row[old_bytes..].copy_from_slice(&n_row[old_bytes..]);
             }
         }
-        out
     }
 }
 
@@ -130,16 +152,17 @@ impl TransitionEffect for NoneTransition {
     fn eased(&self, t: f64) -> f64 {
         t.clamp(0.0, 1.0)
     }
-    fn render(
+    fn render_into(
         &self,
         _old_frame: &[u8],
         new_frame: &[u8],
+        out: &mut [u8],
         _w: u32,
         _h: u32,
         _progress: f64,
         _dir: SlideDir,
-    ) -> Vec<u8> {
-        new_frame.to_vec()
+    ) {
+        out.copy_from_slice(new_frame);
     }
 }
 
@@ -150,36 +173,41 @@ impl TransitionEffect for FadeTransition {
     fn eased(&self, t: f64) -> f64 {
         ease_out_cubic(t)
     }
-    fn render(
+    fn render_into(
         &self,
         old_frame: &[u8],
         new_frame: &[u8],
+        out: &mut [u8],
         w: u32,
         h: u32,
         progress: f64,
         _dir: SlideDir,
-    ) -> Vec<u8> {
+    ) {
         if progress <= 0.0 {
-            return old_frame.to_vec();
+            out.copy_from_slice(old_frame);
+            return;
         }
         if progress >= 1.0 {
-            return new_frame.to_vec();
+            out.copy_from_slice(new_frame);
+            return;
         }
         if old_frame.len() != new_frame.len()
             || old_frame.len() != w as usize * h as usize * 4
         {
-            return new_frame.to_vec();
+            out.copy_from_slice(new_frame);
+            return;
         }
         let a = self.eased(progress);
         // Integer blend: one float->int per frame, then pure integer
         // math per byte.
         let wa = (a * 256.0 + 0.5) as i32;
         let wo = 256 - wa;
-        old_frame
-            .iter()
-            .zip(new_frame.iter())
-            .map(|(&o, &n)| ((i32::from(o) * wo + i32::from(n) * wa + 128) >> 8) as u8)
-            .collect()
+        for (d, (&o, &n)) in out
+            .iter_mut()
+            .zip(old_frame.iter().zip(new_frame.iter()))
+        {
+            *d = ((i32::from(o) * wo + i32::from(n) * wa + 128) >> 8) as u8;
+        }
     }
 }
 

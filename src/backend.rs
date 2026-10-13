@@ -1330,12 +1330,22 @@ impl WaylandBackend {
         let frames = (i64::from(effect.duration_ms()) * ANIM_FPS as i64 / 1000).max(1);
         let frame_ns = 1_000_000_000u64 / ANIM_FPS;
         let t0 = Instant::now();
+        // Reused frame buffers: one animation costs 2 allocations no
+        // matter the frame count (was: one 8MB Vec per frame).
+        let mut buf_a = vec![0u8; new_argb.len()];
+        let mut buf_b = vec![0u8; new_argb.len()];
         for i in 1..=frames {
             if !is_current() {
                 return true; // superseded (or hidden) mid-animation
             }
             let progress = i as f64 / frames as f64;
-            let frame = effect.render(&from, &new_argb, snap.w, snap.h, progress, dir);
+            let frame: &[u8] = if i % 2 == 1 {
+                effect.render_into(&from, &new_argb, &mut buf_a, snap.w, snap.h, progress, dir);
+                &buf_a
+            } else {
+                effect.render_into(&from, &new_argb, &mut buf_b, snap.w, snap.h, progress, dir);
+                &buf_b
+            };
             {
                 let guard = self.shared.lock().unwrap();
                 match guard.outputs.get(&snap.key) {
@@ -1346,7 +1356,7 @@ impl WaylandBackend {
                     _ => return true,
                 }
             }
-            attach_pixels_locked(&self.shared, snap.key, &frame, snap.w, snap.h);
+            attach_pixels_locked(&self.shared, snap.key, frame, snap.w, snap.h);
             if i < frames {
                 let deadline = t0 + Duration::from_nanos(frame_ns * i as u64);
                 let now = Instant::now();

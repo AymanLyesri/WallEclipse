@@ -158,3 +158,48 @@ fn loads_real_png_jpg_webp() {
 fn load_missing_returns_none() {
     assert!(load_image("/tmp/walleclipse-task2/does-not-exist.png").is_none());
 }
+
+#[test]
+fn render_into_matches_render_for_all_effects() {
+    use walleclipse_rs::transition::TransitionEffect;
+    let (w, h) = (64u32, 48u32);
+    let n = w as usize * h as usize * 4;
+    let old = vec![10u8; n];
+    let new = vec![200u8; n];
+    for name in ["slide", "fade", "none"] {
+        let fx = make_transition(name).unwrap();
+        for (p, dir) in [
+            (0.0, SlideDir::Forward),
+            (0.3, SlideDir::Forward),
+            (0.7, SlideDir::Backward),
+            (1.0, SlideDir::None),
+        ] {
+            let mut buf = vec![0u8; n];
+            fx.render_into(&old, &new, &mut buf, w, h, p, dir);
+            assert_eq!(buf, fx.render(&old, &new, w, h, p, dir), "{name} p={p}");
+        }
+    }
+}
+
+#[test]
+fn reused_buffers_produce_correct_frame_sequence() {
+    use walleclipse_rs::transition::TransitionEffect;
+    let (w, h) = (64u32, 48u32);
+    let n = w as usize * h as usize * 4;
+    let old = vec![10u8; n];
+    let new = vec![200u8; n];
+    let fx = make_transition("fade").unwrap();
+    let mut a = vec![0u8; n];
+    let mut b = vec![0u8; n];
+    let frames = 42;
+    for i in 1..=frames {
+        let p = i as f64 / frames as f64;
+        if i % 2 == 1 {
+            fx.render_into(&old, &new, &mut a, w, h, p, SlideDir::None);
+        } else {
+            fx.render_into(&old, &new, &mut b, w, h, p, SlideDir::None);
+        }
+        let got = if i % 2 == 1 { &a } else { &b };
+        assert_eq!(*got, fx.render(&old, &new, w, h, p, SlideDir::None), "frame {i}");
+    }
+}
