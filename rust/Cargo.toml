@@ -1,0 +1,15 @@
+[package]
+name = "walleclipse-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "walleclipse-rs"
+path = "src/main.rs"
+
+[lib]
+name = "walleclipse_rs"
+path = "src/lib.rs"
+
+[dependencies]
+fs2 = "0.4"
