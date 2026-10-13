@@ -52,3 +52,23 @@ fn unknown_transition_name_ignored() {
     backend.set_transition("none");
     assert_eq!(backend.transition(), "none");
 }
+
+#[test]
+fn failed_init_leaves_no_stale_state() {
+    // Headless: every `init` fails cleanly and leaves no stale outputs
+    // or globals behind for the retry. Under a real compositor `init`
+    // may succeed; the assertions below only apply to the failed path,
+    // so the test holds either way.
+    let backend = WaylandBackend::new();
+    if !backend.init(None) {
+        assert!(!backend.running());
+        assert!(backend.outputs().is_empty());
+        // Retry must behave identically (no accumulated stale entries).
+        assert!(!backend.init(None));
+        assert!(!backend.running());
+        assert!(backend.outputs().is_empty());
+        assert!(!backend.is_mapped("DP-1"));
+    }
+    backend.shutdown();
+    assert!(!backend.running());
+}

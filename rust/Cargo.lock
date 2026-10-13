@@ -293,7 +293,6 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "image",
- "wayland-backend",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
