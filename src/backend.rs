@@ -28,8 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_registry, wl_shm,
+        wl_shm_pool, wl_surface,
     },
     Connection, Dispatch, EventQueue, QueueHandle,
 };
@@ -38,6 +38,25 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 
 use crate::image::{scale_cover_argb, DecodedImage};
 use crate::transition::{effect_name_for, make_transition, ScaledCache, SlideDir};
+
+// glibc: hand freed heap back to the OS. A 1080p ARGB frame is 8MB, and a
+// preview fade allocates a few of them per call; without this the freed
+// blocks stay in the process's arena and the daemon's RSS parks hundreds
+// of MB above its baseline after a handful of hovers (measured: 381MB
+// idle -> 800MB after 20 preview/clear cycles). No-ops off glibc.
+#[cfg(target_env = "gnu")]
+extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+/// Return freed heap to the OS (glibc). Cheap enough to call once at the
+/// end of a preview show/clear; a no-op on non-glibc targets.
+fn trim_heap() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        malloc_trim(0);
+    }
+}
 
 /// Log sink, mirroring C++ `WaylandBackend::LogFn`.
 pub type LogFn = Arc<dyn Fn(String) + Send + Sync + 'static>;
@@ -192,6 +211,107 @@ struct DeadHandles {
     output: Option<(wl_output::WlOutput, u32)>,
 }
 
+/// Overlay preview surface for one output: a transient `Layer::Overlay`
+/// layer surface above the background, used for hover previews. Lives in
+/// `Shared::preview_surfaces` (keyed by output global), parallel to
+/// `OutputRecord` — never in `OutputRecord.surface`, so show/clear never
+/// disturbs the background underneath.
+struct PreviewRecord {
+    surface: Option<wl_surface::WlSurface>,
+    layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
+    slots: [Option<ShmSlot>; 2],
+    slot_idx: usize,
+    /// Monotonic attach counter; feeds `PreviewSlotTag::seq`.
+    buf_seq: u64,
+    /// Configure size of the preview layer surface (0 until first ack).
+    cfg_w: u32,
+    cfg_h: u32,
+    configured: bool,
+    /// False until a buffer is attached (nil attach unmaps).
+    mapped: bool,
+    /// Image waiting for (or surviving) configure.
+    pending: Option<Arc<DecodedImage>>,
+    /// Last presented frame, for fade-out.
+    last_frame: Vec<u8>,
+    last_w: u32,
+    last_h: u32,
+    scaled: ScaledCache,
+    /// Current opacity (1.0 shown, 0.0 cleared); tracks the fade progress
+    /// while animating.
+    alpha: f32,
+    /// Bumps on every show/clear; animation loops abort when stale.
+    generation: u64,
+}
+
+impl PreviewRecord {
+    /// Tear down surface/buffers/pools but keep `pending` so a later
+    /// configure or `show_preview` re-attaches. Only call outside
+    /// Dispatch callbacks (e.g. `shutdown`, after the dispatch thread is
+    /// joined); callbacks must use the graveyard instead.
+    fn teardown_surface(&mut self) {
+        self.configured = false;
+        self.mapped = false;
+        self.alpha = 0.0;
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(layer) = self.layer.take() {
+            layer.destroy();
+        }
+        if let Some(surface) = self.surface.take() {
+            surface.destroy();
+        }
+        for slot in self.slots.iter_mut() {
+            if let Some(s) = slot.take() {
+                if let Some(buffer) = s.buffer {
+                    buffer.destroy();
+                }
+                if let Some(pool) = s.pool {
+                    pool.destroy();
+                }
+                // `File` closes on drop.
+            }
+        }
+    }
+
+    /// Move every live Wayland handle out of the record into a graveyard
+    /// entry. Destruction happens later in `drain_graveyard_locked`, never
+    /// inside a Dispatch callback.
+    fn into_dead(mut self) -> DeadHandles {
+        let mut pools = Vec::new();
+        let mut buffers = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(s) = slot.take() {
+                pools.extend(s.pool);
+                buffers.extend(s.buffer);
+            }
+        }
+        DeadHandles {
+            surface: self.surface.take(),
+            layer: self.layer.take(),
+            buffers,
+            pools,
+            xdg: None,
+            output: None,
+        }
+    }
+}
+
+/// Dispatch udata for preview layer surfaces: the output global they
+/// overlay. Distinct from the background `u32` udata so preview
+/// configure/closed events route to their own `Dispatch` impl instead of
+/// the background one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreviewLayerTag(u32);
+
+/// Tag attached to each preview `wl_buffer` so release events can be
+/// routed back to the exact preview (output, slot) that owns it. `seq`
+/// guards against stale releases, mirroring `SlotTag`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewSlotTag {
+    output: u32,
+    slot: usize,
+    seq: u64,
+}
+
 struct Shared {
     log: Option<LogFn>,
     conn: Option<Connection>,
@@ -203,6 +323,10 @@ struct Shared {
     xdg_mgr: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     /// Keyed by `wl_registry` global name.
     outputs: HashMap<u32, OutputRecord>,
+    /// Transient Overlay preview surfaces, keyed by output global.
+    /// Parallel to `outputs`: preview show/clear never touches the
+    /// background record underneath.
+    preview_surfaces: HashMap<u32, PreviewRecord>,
     /// Handles moved out of records inside Dispatch callbacks; destroyed
     /// by `drain_graveyard_locked` outside callbacks. See `DeadHandles`.
     graveyard: Vec<DeadHandles>,
@@ -318,6 +442,9 @@ fn on_surface_closed(shared: &Arc<Mutex<Shared>>, key: u32) {
         }
     };
     guard.graveyard.push(dead);
+    // The overlay belongs to the same output: retire it on the same path
+    // so a later show_preview rebuilds from clean state.
+    retire_preview_locked(&mut guard, key);
     guard.vlog("layer surface closed, will repaint on next setWallpaper/configure");
 }
 
@@ -328,6 +455,10 @@ fn on_surface_closed(shared: &Arc<Mutex<Shared>>, key: u32) {
 fn on_global_remove(shared: &Arc<Mutex<Shared>>, name: u32) {
     let mut guard = shared.lock().unwrap();
     guard.vlog(&format!("output global {name} removed (hotplug/sleep?)"));
+    // The overlay dies with its output: same-path retirement.
+    if let Some(prec) = guard.preview_surfaces.remove(&name) {
+        guard.graveyard.push(prec.into_dead());
+    }
     let Some(rec) = guard.outputs.remove(&name) else {
         return; // not an output global (compositor/shm/...)
     };
@@ -346,6 +477,7 @@ fn on_global_remove(shared: &Arc<Mutex<Shared>>, name: u32) {
 /// abandoned and its fd close releases server-side objects.
 fn reset_live_locked(shared: &mut Shared) {
     shared.outputs.clear();
+    shared.preview_surfaces.clear();
     shared.graveyard.clear();
     shared.compositor = None;
     shared.shm = None;
@@ -782,6 +914,571 @@ fn cover_cached(
     argb
 }
 
+/// (Re)create the Overlay preview surface + initial empty commit. True
+/// when a preview layer surface exists afterwards (buffer still waits for
+/// configure). Mirrors `ensure_surface_locked` with `Layer::Overlay`,
+/// `set_exclusive_zone(-1)` and an empty input region (a region with no
+/// rects), so the preview floats above the background and never takes
+/// input. Call with `shared` locked.
+fn ensure_preview_surface_locked(shared: &mut Shared, key: u32) -> bool {
+    let (compositor, layer_shell) = match (&shared.compositor, &shared.layer_shell) {
+        (Some(c), Some(l)) => (c.clone(), l.clone()),
+        _ => return false,
+    };
+    let qh = match &shared.qh {
+        Some(qh) => qh.clone(),
+        None => return false,
+    };
+    let output = match shared.outputs.get(&key) {
+        Some(rec) => rec.output.clone(),
+        None => return false,
+    };
+    if shared
+        .preview_surfaces
+        .get(&key)
+        .is_some_and(|prec| prec.layer.is_some())
+    {
+        return true;
+    }
+    let surface: wl_surface::WlSurface = compositor.create_surface(&qh, ());
+    // Empty input region: the overlay is purely visual.
+    let region = compositor.create_region(&qh, ());
+    surface.set_input_region(Some(&region));
+    region.destroy();
+    let layer = layer_shell.get_layer_surface(
+        &surface,
+        Some(&output),
+        zwlr_layer_shell_v1::Layer::Overlay,
+        "walleclipse-preview".to_owned(),
+        &qh,
+        PreviewLayerTag(key),
+    );
+    layer.set_size(0, 0);
+    layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer.set_exclusive_zone(-1);
+    let prec = shared
+        .preview_surfaces
+        .entry(key)
+        .or_insert_with(|| PreviewRecord {
+            surface: None,
+            layer: None,
+            slots: [None, None],
+            slot_idx: 0,
+            buf_seq: 0,
+            cfg_w: 0,
+            cfg_h: 0,
+            configured: false,
+            mapped: false,
+            pending: None,
+            last_frame: Vec::new(),
+            last_w: 0,
+            last_h: 0,
+            scaled: ScaledCache::new(),
+            alpha: 0.0,
+            generation: 0,
+        });
+    prec.surface = Some(surface);
+    prec.layer = Some(layer);
+    prec.configured = false;
+    // Initial commit WITHOUT a buffer: the compositor replies with
+    // configure; only then may a buffer be attached.
+    if let Some(surface) = &prec.surface {
+        surface.commit();
+    }
+    shared.flush();
+    true
+}
+
+/// Preview geometry: its own configure size once acked, else the output
+/// size underneath (the overlay always covers the full output).
+/// Call with `shared` locked.
+fn preview_size_locked(shared: &Shared, key: u32) -> (u32, u32) {
+    if let Some(prec) = shared.preview_surfaces.get(&key) {
+        if prec.cfg_w > 0 && prec.cfg_h > 0 {
+            return (prec.cfg_w, prec.cfg_h);
+        }
+    }
+    shared
+        .outputs
+        .get(&key)
+        .map(|rec| rec.size())
+        .unwrap_or((FALLBACK_W, FALLBACK_H))
+}
+
+/// Cover-fit `img` into `w*h`, reusing the per-preview cache.
+/// Locking mirrors `cover_cached`: lookup under lock, scale outside it.
+fn cover_cached_preview(
+    shared: &Arc<Mutex<Shared>>,
+    key: u32,
+    img: &Arc<DecodedImage>,
+    w: u32,
+    h: u32,
+) -> Vec<u8> {
+    {
+        let guard = shared.lock().unwrap();
+        if let Some(prec) = guard.preview_surfaces.get(&key) {
+            if let Some(hit) = prec.scaled.find(img, w, h) {
+                return hit.clone();
+            }
+        }
+    }
+    let argb = scale_cover_argb(img, w, h);
+    {
+        let mut guard = shared.lock().unwrap();
+        if let Some(prec) = guard.preview_surfaces.get_mut(&key) {
+            if prec.scaled.find(img, w, h).is_none() {
+                prec.scaled.store(Arc::clone(img), w, h, argb.clone());
+            }
+        }
+    }
+    argb
+}
+
+/// Preview twin of `wait_for_free_slot`: the same release-gated search
+/// over the preview record's slots. Never holds the lock while waiting.
+fn wait_for_free_preview_slot(
+    shared: &Arc<Mutex<Shared>>,
+    key: u32,
+    size: usize,
+    budget: Duration,
+) -> Option<usize> {
+    let start = Instant::now();
+    loop {
+        {
+            let guard = shared.lock().unwrap();
+            let prec = match guard.preview_surfaces.get(&key) {
+                Some(prec) => prec,
+                None => return None,
+            };
+            for k in 0..2 {
+                let i = (prec.slot_idx + k) % 2;
+                match prec.slots[i].as_ref() {
+                    Some(slot) if slot.size == size && slot.pool.is_some() && !slot.busy => {
+                        return Some(i);
+                    }
+                    _ => {}
+                }
+            }
+            let fallback_usable = prec.slots[prec.slot_idx % 2]
+                .as_ref()
+                .is_some_and(|slot| slot.size == size && slot.pool.is_some());
+            if !fallback_usable {
+                return None;
+            }
+            if start.elapsed() >= budget {
+                return Some(prec.slot_idx % 2);
+            }
+        }
+        std::thread::sleep(SLOT_WAIT_STEP);
+    }
+}
+
+/// Preview twin of `on_buffer_release`: clears the owning preview slot's
+/// busy flag (seq-guarded) and retires the buffer. Callback-safe: flags +
+/// graveyard moves only, never destruction.
+fn on_preview_release(shared: &Arc<Mutex<Shared>>, tag: &PreviewSlotTag) {
+    let mut guard = shared.lock().unwrap();
+    let released = {
+        let prec = match guard.preview_surfaces.get_mut(&tag.output) {
+            Some(prec) => prec,
+            None => return,
+        };
+        let slot = match prec.slots.get_mut(tag.slot) {
+            Some(slot) => match slot.as_mut() {
+                Some(slot) => slot,
+                None => return,
+            },
+            None => return,
+        };
+        if slot.seq != tag.seq || !slot.busy {
+            return;
+        }
+        slot.busy = false;
+        slot.buffer.take()
+    };
+    if let Some(buffer) = released {
+        guard.retire_buffer(buffer);
+    }
+}
+
+/// Attach `argb` (`w*h*4` ARGB8888) to the preview's overlay surface using
+/// a release-gated SHM slot. Preview twin of `attach_pixels_locked`:
+/// same three phases (snapshot + allocate, lock-free slot wait, atomic
+/// write/create/attach/store), plus preview bookkeeping (`mapped`,
+/// `last_frame` for fade-out). `generation` must be the caller's snapshot
+/// generation: a stale attach (superseded show/clear, or a surface
+/// recreated under the same record) is refused entirely — it neither
+/// commits a buffer nor pins `mapped`, so an aborted show can never
+/// re-present pixels over a dismissal. Returns true only when pixels
+/// attached and stored; any no-op returns false so callers pin
+/// shown-state on success alone.
+fn attach_preview_pixels_locked(
+    shared: &Arc<Mutex<Shared>>,
+    key: u32,
+    argb: &[u8],
+    w: u32,
+    h: u32,
+    generation: u64,
+    store_frame: bool,
+) -> bool {
+    // `store_frame` copies this frame into `last_frame` (the fade-out
+    // source). It is false for intermediate fade frames: a ~40-frame fade
+    // would otherwise copy 8MB per frame, per show and per clear — churn
+    // that never returns to the OS and parks the daemon's RSS hundreds of
+    // MB above its baseline.
+    if w == 0 || h == 0 || argb.len() != w as usize * h as usize * 4 {
+        return false;
+    }
+    let size = w as usize * h as usize * 4;
+    let stride = w as i32 * 4;
+    // Phase 1: validate + snapshot handles + (re)allocate pools.
+    let (surface, qh) = {
+        let mut guard = shared.lock().unwrap();
+        {
+            let prec = match guard.preview_surfaces.get(&key) {
+                Some(prec) => prec,
+                None => return false,
+            };
+            if prec.surface.is_none()
+                || prec.layer.is_none()
+                || !prec.configured
+                || prec.generation != generation
+            {
+                return false;
+            }
+        }
+        let (surface, shm, qh) = match (
+            guard
+                .preview_surfaces
+                .get(&key)
+                .and_then(|prec| prec.surface.clone()),
+            guard.shm.clone(),
+            guard.qh.clone(),
+        ) {
+            (Some(surface), Some(shm), Some(qh)) => (surface, shm, qh),
+            _ => return false,
+        };
+        let need_new = guard
+            .preview_surfaces
+            .get(&key)
+            .map(|prec| {
+                prec.slots[0]
+                    .as_ref()
+                    .map(|slot| slot.size != size || slot.pool.is_none())
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        if need_new {
+            let mut retired_pools = Vec::new();
+            let mut retired_buffers = Vec::new();
+            if let Some(prec) = guard.preview_surfaces.get_mut(&key) {
+                for slot in prec.slots.iter_mut() {
+                    if let Some(s) = slot.take() {
+                        retired_pools.extend(s.pool);
+                        retired_buffers.extend(s.buffer);
+                    }
+                }
+            }
+            for pool in retired_pools {
+                guard.retire_pool(pool);
+            }
+            for buffer in retired_buffers {
+                guard.retire_buffer(buffer);
+            }
+            let mut files = Vec::new();
+            for _ in 0..2 {
+                match create_shm_file(size) {
+                    Ok(file) => files.push(file),
+                    Err(_) => return false,
+                }
+            }
+            let mut files = files.into_iter();
+            if let Some(prec) = guard.preview_surfaces.get_mut(&key) {
+                for slot in prec.slots.iter_mut() {
+                    let file = match files.next() {
+                        Some(file) => file,
+                        None => return false,
+                    };
+                    let pool = shm.create_pool(file.as_fd(), size as i32, &qh, ());
+                    *slot = Some(ShmSlot {
+                        file,
+                        size,
+                        pool: Some(pool),
+                        buffer: None,
+                        busy: false,
+                        seq: 0,
+                    });
+                }
+                prec.slot_idx = 0;
+            }
+        }
+        (surface, qh)
+    };
+    // Phase 2: wait for a free slot without holding the lock.
+    let idx = match wait_for_free_preview_slot(shared, key, size, SLOT_WAIT_BUDGET) {
+        Some(idx) => idx,
+        None => return false,
+    };
+    // Phase 3: write pixels, create the tagged buffer, attach — atomically
+    // under one lock hold so a release for our tag cannot slip between
+    // create and store.
+    {
+        let mut guard = shared.lock().unwrap();
+        {
+            let prec = match guard.preview_surfaces.get(&key) {
+                Some(prec) => prec,
+                None => return false,
+            };
+            if !prec.configured
+                || prec.surface.is_none()
+                || prec.layer.is_none()
+                || prec.generation != generation
+            {
+                return false;
+            }
+            if prec.slots[idx]
+                .as_ref()
+                .map(|slot| slot.size != size || slot.pool.is_none())
+                .unwrap_or(true)
+            {
+                return false;
+            }
+        }
+        let (pool, tag, displaced) = {
+            let prec = match guard.preview_surfaces.get_mut(&key) {
+                Some(prec) => prec,
+                None => return false,
+            };
+            let slot = match prec.slots[idx].as_mut() {
+                Some(slot) => slot,
+                None => return false,
+            };
+            if slot.file.write_all_at(argb, 0).is_err() {
+                return false;
+            }
+            prec.buf_seq = prec.buf_seq.wrapping_add(1);
+            slot.seq = prec.buf_seq;
+            slot.busy = true;
+            let pool = match slot.pool.clone() {
+                Some(pool) => pool,
+                None => return false,
+            };
+            // Still-busy slot (wait budget exhausted): the in-flight buffer
+            // is retired; its late release is discarded by seq mismatch.
+            let displaced = slot.buffer.take();
+            (
+                pool,
+                PreviewSlotTag {
+                    output: key,
+                    slot: idx,
+                    seq: slot.seq,
+                },
+                displaced,
+            )
+        };
+        if let Some(old) = displaced {
+            guard.retire_buffer(old);
+        }
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+            &qh,
+            tag,
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.commit();
+        guard.flush();
+        let stored = {
+            let mut buffer = Some(buffer);
+            let (stale, stored) = {
+                let prec = match guard.preview_surfaces.get_mut(&key) {
+                    Some(prec) => prec,
+                    None => {
+                        if let Some(buffer) = buffer.take() {
+                            guard.retire_buffer(buffer);
+                        }
+                        return false;
+                    }
+                };
+                match prec.slots[idx].as_mut() {
+                    Some(slot) if slot.seq == tag.seq => {
+                        let stale = slot.buffer.take();
+                        slot.buffer = buffer.take();
+                        prec.slot_idx = (idx + 1) % 2;
+                        prec.mapped = true;
+                        if store_frame {
+                            prec.last_frame = argb.to_vec();
+                            prec.last_w = w;
+                            prec.last_h = h;
+                        }
+                        (stale, true)
+                    }
+                    _ => (None, false),
+                }
+            };
+            if let Some(stale) = stale {
+                guard.retire_buffer(stale);
+            }
+            // `buffer` is `Some` only when not stored (superseded/gone).
+            if let Some(buffer) = buffer.take() {
+                guard.retire_buffer(buffer);
+            }
+            stored
+        };
+        stored
+    }
+}
+
+/// Scale the preview's pending image cover-fit and attach.
+/// Preview twin of `attach_locked`: two phases so the scale never blocks
+/// Wayland event dispatch.
+fn attach_preview_locked(shared: &Arc<Mutex<Shared>>, key: u32) {
+    let (img, w, h, generation) = {
+        let guard = shared.lock().unwrap();
+        let prec = match guard.preview_surfaces.get(&key) {
+            Some(prec) => prec,
+            None => return,
+        };
+        if prec.surface.is_none() || prec.layer.is_none() || !prec.configured {
+            return;
+        }
+        let pending = match prec.pending.clone() {
+            Some(img) => img,
+            None => return,
+        };
+        let (w, h) = preview_size_locked(&guard, key);
+        (pending, w, h, prec.generation)
+    };
+    let argb = cover_cached_preview(shared, key, &img, w, h);
+    let guard = shared.lock().unwrap();
+    // Skip when superseded between scale and attach.
+    let current = guard
+        .preview_surfaces
+        .get(&key)
+        .filter(|prec| prec.configured && prec.generation == generation)
+        .and_then(|prec| prec.pending.clone())
+        .is_some_and(|pending| Arc::ptr_eq(&pending, &img));
+    drop(guard);
+    if current && attach_preview_pixels_locked(shared, key, &argb, w, h, generation, true) {
+        // The pending image is now fully presented. This path never runs
+        // the fade loop, so pin opacity here — otherwise `mapped` would be
+        // true with `alpha == 0.0` and `has_preview` would read false while
+        // pixels are on screen. Still ptr-guarded: a clear landing between
+        // the attach and this pin owns `alpha` from here on.
+        let mut guard = shared.lock().unwrap();
+        if let Some(prec) = guard.preview_surfaces.get_mut(&key) {
+            if prec.generation == generation
+                && prec.pending.as_ref().is_some_and(|p| Arc::ptr_eq(p, &img))
+            {
+                prec.alpha = 1.0;
+            }
+        }
+    }
+}
+
+/// Nil-attach the preview surface (unmap) and flag it down, but only when
+/// `generation` still matches (superseded clears must not unmap a newer
+/// show). The overlay vanishes; the background underneath shows through
+/// untouched.
+///
+/// The nil-attach commit and the flag clear share one lock hold: an
+/// attach running concurrently can only land entirely before this (its
+/// pixels are then overwritten by the nil commit) or entirely after (its
+/// own `mapped = true` stands), never between the commit and the flag
+/// clear — which would leave pixels on screen with `mapped == false` and
+/// strand the overlay against every later dismiss.
+fn unmap_preview_locked(shared: &Arc<Mutex<Shared>>, key: u32, generation: u64) {
+    let mut guard = shared.lock().unwrap();
+    let surface = match guard.preview_surfaces.get(&key) {
+        Some(prec) if prec.generation == generation => prec.surface.clone(),
+        _ => return,
+    };
+    if let Some(surface) = surface {
+        surface.attach(None, 0, 0);
+        surface.commit();
+    }
+    if let Some(prec) = guard.preview_surfaces.get_mut(&key) {
+        if prec.generation == generation {
+            prec.mapped = false;
+            prec.alpha = 0.0;
+            prec.last_frame.clear();
+            prec.last_w = 0;
+            prec.last_h = 0;
+            // The NULL commit above unmaps this layer surface, which makes
+            // it unconfigured again: attaching a buffer before the next
+            // configure is a protocol error that tears down the whole
+            // wl_display connection. `show_preview` re-requests a configure
+            // (empty commit) and pends until the handler attaches.
+            prec.configured = false;
+            // Drop the scaled-frame cache with the overlay: up to a dozen
+            // 1080p frames (~100MB) would otherwise sit resident while no
+            // preview is on screen. A re-hover re-scales (~90ms), which the
+            // panel's hover dwell hides.
+            prec.scaled.clear();
+        }
+    }
+    guard.flush();
+    drop(guard);
+    // Every dismiss funnels through here, so the frames the fade/attach
+    // allocated are released to the OS from one place.
+    trim_heap();
+}
+
+/// Move one preview record's live handles to the graveyard (generation
+/// bump, unmap, pending/cache kept for the next show). Call with `shared`
+/// locked; moves only, never destruction.
+fn retire_preview_locked(shared: &mut Shared, key: u32) {
+    let dead = {
+        let Some(prec) = shared.preview_surfaces.get_mut(&key) else {
+            return;
+        };
+        prec.configured = false;
+        prec.mapped = false;
+        prec.alpha = 0.0;
+        // Pixels die with the surface: drop the frame cache too, so a later
+        // dismiss never fades from (or mistakes) a stale frame.
+        prec.last_frame.clear();
+        prec.last_w = 0;
+        prec.last_h = 0;
+        prec.generation = prec.generation.wrapping_add(1);
+        let mut pools = Vec::new();
+        let mut buffers = Vec::new();
+        for slot in prec.slots.iter_mut() {
+            if let Some(s) = slot.as_mut() {
+                pools.extend(s.pool.take());
+                buffers.extend(s.buffer.take());
+                s.busy = false;
+            }
+        }
+        DeadHandles {
+            surface: prec.surface.take(),
+            layer: prec.layer.take(),
+            buffers,
+            pools,
+            xdg: None,
+            output: None,
+        }
+    };
+    shared.graveyard.push(dead);
+    shared.vlog("preview surface retired, will rebuild on next show_preview");
+}
+
+/// Handle a preview layer-surface `closed` event: flags + handle moves
+/// only, destruction deferred to the graveyard. See `on_surface_closed`.
+fn on_preview_closed(shared: &Arc<Mutex<Shared>>, key: u32) {
+    let mut guard = shared.lock().unwrap();
+    retire_preview_locked(&mut guard, key);
+}
+
 fn valid_img(img: &DecodedImage) -> bool {
     img.width > 0 && img.height > 0 && !img.rgba.is_empty()
 }
@@ -1010,6 +1707,55 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for WlState {
     }
 }
 
+/// Preview overlay layer surfaces carry a [`PreviewLayerTag`] (not the
+/// background `u32`), so their configure/closed events land here instead
+/// of the background handler: configure arms the preview record (the
+/// pending image attaches, never before the first acked configure — fatal
+/// otherwise), closed retires it to the graveyard.
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, PreviewLayerTag> for WlState {
+    fn event(
+        state: &mut Self,
+        proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        tag: &PreviewLayerTag,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let key = tag.0;
+        let need_attach = {
+            let mut guard = state.shared.lock().unwrap();
+            match event {
+                zwlr_layer_surface_v1::Event::Configure {
+                    serial,
+                    width,
+                    height,
+                } => {
+                    proxy.ack_configure(serial);
+                    let Some(prec) = guard.preview_surfaces.get_mut(&key) else {
+                        return;
+                    };
+                    prec.configured = true;
+                    prec.cfg_w = width;
+                    prec.cfg_h = height;
+                    prec.pending.clone().is_some()
+                }
+                zwlr_layer_surface_v1::Event::Closed => {
+                    // Drop the lock first: the retire path locks internally,
+                    // and destruction must never happen inside this callback.
+                    drop(guard);
+                    on_preview_closed(&state.shared, key);
+                    return;
+                }
+                _ => return,
+            }
+        };
+        if need_attach {
+            // Scale outside the lock; attach_preview_locked re-validates.
+            attach_preview_locked(&state.shared, key);
+        }
+    }
+}
+
 /// Routes compositor `wl_buffer.release` events back to the owning slot.
 /// Runs inside the buffer's own dispatch callback: flags + graveyard
 /// moves only, never destruction. See `on_buffer_release`.
@@ -1029,7 +1775,26 @@ impl Dispatch<wl_buffer::WlBuffer, SlotTag> for WlState {
     }
 }
 
+/// Routes compositor `wl_buffer.release` events for preview buffers back
+/// to the owning preview slot. See `on_preview_release`.
+impl Dispatch<wl_buffer::WlBuffer, PreviewSlotTag> for WlState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        tag: &PreviewSlotTag,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_buffer::Event::Release => on_preview_release(&state.shared, tag),
+            _ => {}
+        }
+    }
+}
+
 wayland_client::delegate_noop!(WlState: ignore wl_compositor::WlCompositor);
+wayland_client::delegate_noop!(WlState: ignore wl_region::WlRegion);
 wayland_client::delegate_noop!(WlState: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(WlState: ignore wl_surface::WlSurface);
 wayland_client::delegate_noop!(WlState: ignore wl_shm_pool::WlShmPool);
@@ -1059,6 +1824,7 @@ impl WaylandBackend {
                 layer_shell: None,
                 xdg_mgr: None,
                 outputs: HashMap::new(),
+                preview_surfaces: HashMap::new(),
                 graveyard: Vec::new(),
                 pending_by_monitor: HashMap::new(),
                 transition_name: "slide".to_owned(),
@@ -1176,6 +1942,9 @@ impl WaylandBackend {
                 if rec.wl_version >= 3 {
                     rec.output.release();
                 }
+            }
+            for (_, mut prec) in guard.preview_surfaces.drain() {
+                prec.teardown_surface();
             }
             guard.compositor = None;
             guard.shm = None;
@@ -1498,6 +2267,429 @@ impl WaylandBackend {
         }
     }
 
+    /// Show a transient fullscreen preview overlay on a monitor
+    /// (cover-fit). The overlay is a `Layer::Overlay` surface floating
+    /// above the untouched background: it takes no input and fades in from
+    /// transparent via the fade effect. Re-previewing replaces the active
+    /// preview in place. Returns `false` when the monitor is unknown or no
+    /// preview surface can be created (headless / no compositor).
+    pub fn show_preview(&self, monitor: &str, img: Arc<DecodedImage>) -> bool {
+        if !valid_img(&img) {
+            return false;
+        }
+        drain_graveyard(&self.shared);
+        struct Snapshot {
+            key: u32,
+            w: u32,
+            h: u32,
+            generation: u64,
+        }
+        let snap = {
+            let mut guard = self.shared.lock().unwrap();
+            let key = match guard.find_key(monitor) {
+                Some(key) => key,
+                None => return false,
+            };
+            if !ensure_preview_surface_locked(&mut guard, key) {
+                return false;
+            }
+            let (w, h) = preview_size_locked(&guard, key);
+            let prec = match guard.preview_surfaces.get_mut(&key) {
+                Some(prec) => prec,
+                None => return false,
+            };
+            prec.pending = Some(Arc::clone(&img));
+            prec.generation = prec.generation.wrapping_add(1);
+            // An unmapped (or brand-new) layer surface must be configured
+            // before any buffer may be attached. Ask for that configure with
+            // an empty commit and let the configure handler attach `pending`
+            // — exactly like the background's remap path. Without this the
+            // surface never reconfigures, so the preview could not come back
+            // after a dismiss.
+            let needs_configure = !prec.configured;
+            let surface = prec.surface.clone();
+            let snap = Snapshot {
+                key,
+                w,
+                h,
+                generation: prec.generation,
+            };
+            if needs_configure {
+                if let Some(surface) = surface {
+                    surface.commit();
+                }
+                guard.flush();
+            }
+            snap
+        };
+        let new_argb = cover_cached_preview(&self.shared, snap.key, &img, snap.w, snap.h);
+        let is_current = || {
+            self.shared
+                .lock()
+                .unwrap()
+                .preview_surfaces
+                .get(&snap.key)
+                .is_some_and(|prec| prec.generation == snap.generation)
+        };
+        // Fade duration source of truth (same constant the background
+        // switches animate with); `transition == "none"` cuts straight to
+        // the opaque frame.
+        let no_anim = self.shared.lock().unwrap().transition_name == "none"
+            || make_transition("fade")
+                .map(|e| e.duration_ms() <= 0)
+                .unwrap_or(true);
+        if no_anim {
+            let attach = {
+                let guard = self.shared.lock().unwrap();
+                let prec = match guard.preview_surfaces.get(&snap.key) {
+                    Some(prec) if prec.generation == snap.generation => prec,
+                    // Superseded by a newer show/clear, or output vanished.
+                    _ => return true,
+                };
+                if !prec.configured {
+                    return true; // pends until configure (handler attaches)
+                }
+                prec.surface.is_some() && prec.layer.is_some()
+            };
+            let attached = if attach {
+                attach_preview_pixels_locked(
+                    &self.shared,
+                    snap.key,
+                    &new_argb,
+                    snap.w,
+                    snap.h,
+                    snap.generation,
+                    true,
+                )
+            } else {
+                false
+            };
+            // Pin shown-state only when pixels actually attached: a no-op
+            // (surface gone mid-call, SHM failure) leaves the record
+            // pending exactly like the animated path, so `has_preview`
+            // stays false until the configure handler presents.
+            if attached {
+                let mut guard = self.shared.lock().unwrap();
+                if let Some(prec) = guard.preview_surfaces.get_mut(&snap.key) {
+                    if prec.generation == snap.generation {
+                        prec.mapped = true;
+                        prec.alpha = 1.0;
+                        prec.last_frame = new_argb.clone();
+                        prec.last_w = snap.w;
+                        prec.last_h = snap.h;
+                    }
+                }
+            }
+            return true;
+        }
+        let effect = make_transition("fade").expect("checked duration above");
+        // Transparent-black start; the fade blends it into the image,
+        // scaling alpha from 0 to 1 (`SlideDir::None` = pure cross-blend).
+        let from = vec![0u8; new_argb.len()];
+        let frames = (i64::from(effect.duration_ms()) * ANIM_FPS as i64 / 1000).max(1);
+        let frame_ns = 1_000_000_000u64 / ANIM_FPS;
+        let t0 = Instant::now();
+        // Reused frame buffers: one animation costs 2 allocations no
+        // matter the frame count.
+        let mut buf_a = vec![0u8; new_argb.len()];
+        let mut buf_b = vec![0u8; new_argb.len()];
+        for i in 1..=frames {
+            if !is_current() {
+                return true; // superseded by a newer show/clear
+            }
+            let progress = i as f64 / frames as f64;
+            let frame: &[u8] = if i % 2 == 1 {
+                effect.render_into(
+                    &from,
+                    &new_argb,
+                    &mut buf_a,
+                    snap.w,
+                    snap.h,
+                    progress,
+                    SlideDir::None,
+                );
+                &buf_a
+            } else {
+                effect.render_into(
+                    &from,
+                    &new_argb,
+                    &mut buf_b,
+                    snap.w,
+                    snap.h,
+                    progress,
+                    SlideDir::None,
+                );
+                &buf_b
+            };
+            let ok = {
+                let mut guard = self.shared.lock().unwrap();
+                match guard.preview_surfaces.get_mut(&snap.key) {
+                    Some(prec)
+                        if prec.generation == snap.generation
+                            && prec.configured
+                            && prec.surface.is_some()
+                            && prec.layer.is_some() =>
+                    {
+                        prec.alpha = progress as f32;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if !ok {
+                return true;
+            }
+            attach_preview_pixels_locked(
+                &self.shared,
+                snap.key,
+                frame,
+                snap.w,
+                snap.h,
+                snap.generation,
+                false,
+            );
+            if i < frames {
+                let deadline = t0 + Duration::from_nanos(frame_ns * i as u64);
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
+            }
+        }
+        {
+            // Final pin, re-checked for currency: a clear landing between
+            // the last attach and this pin bumps the generation, and the
+            // stale pin must not re-arm the dismissed preview.
+            if is_current() {
+                let mut guard = self.shared.lock().unwrap();
+                if let Some(prec) = guard.preview_surfaces.get_mut(&snap.key) {
+                    if prec.generation == snap.generation {
+                        prec.mapped = true;
+                        prec.alpha = 1.0;
+                        // The fade skipped its per-frame copies, so record
+                        // the settled frame here as the fade-out source.
+                        // `copy_from_slice` reuses the existing allocation
+                        // on repeat previews instead of reallocating 8MB.
+                        if prec.last_frame.len() == new_argb.len() {
+                            prec.last_frame.copy_from_slice(&new_argb);
+                        } else {
+                            prec.last_frame = new_argb.clone();
+                        }
+                        prec.last_w = snap.w;
+                        prec.last_h = snap.h;
+                    }
+                }
+            }
+        }
+        // The fade's frame buffers are dead now; give their pages back.
+        trim_heap();
+        true
+    }
+
+    /// Dismiss the preview overlay on a monitor, fading back to transparent
+    /// (same duration source as the fade-in) and finishing with a nil
+    /// attach that unmaps the overlay, so the untouched background shows
+    /// through. Idle monitors — and unknown monitors — return `true`
+    /// immediately (idempotent). Generation-guarded like `show_preview`.
+    pub fn clear_preview(&self, monitor: &str) -> bool {
+        drain_graveyard(&self.shared);
+        struct Snapshot {
+            key: u32,
+            w: u32,
+            h: u32,
+            from: Vec<u8>,
+            generation: u64,
+        }
+        let snap = {
+            let mut guard = self.shared.lock().unwrap();
+            let key = match guard.find_key(monitor) {
+                // Unknown monitor: nothing to dismiss (idempotent).
+                Some(key) => key,
+                None => return true,
+            };
+            let prec = match guard.preview_surfaces.get_mut(&key) {
+                Some(prec) => prec,
+                None => return true,
+            };
+            // Abort any in-flight show and drop a pending-but-unmapped
+            // preview so a later configure cannot resurrect it.
+            prec.generation = prec.generation.wrapping_add(1);
+            prec.pending = None;
+            if !prec.mapped && prec.last_frame.is_empty() && prec.alpha <= 0.0 {
+                // Pending-only/idle record: nothing may be on screen.
+                return true;
+            }
+            if !prec.mapped {
+                // Possibly-presented but unmapped (stale frame cache or
+                // leftover opacity after surface death/failed attaches):
+                // never early-true past it — nil-attach straight to the
+                // unmap (no fade; nothing is claimed visible, so fading
+                // would only flash pixels back on).
+                let generation = prec.generation;
+                drop(guard);
+                unmap_preview_locked(&self.shared, key, generation);
+                return true;
+            }
+            let generation = prec.generation;
+            if prec.last_frame.is_empty() || prec.last_w == 0 || prec.last_h == 0 {
+                // Mapped without a frame on record: unmap directly.
+                drop(guard);
+                unmap_preview_locked(&self.shared, key, generation);
+                return true;
+            }
+            Snapshot {
+                key,
+                w: prec.last_w,
+                h: prec.last_h,
+                from: prec.last_frame.clone(),
+                generation,
+            }
+        };
+        let is_current = || {
+            self.shared
+                .lock()
+                .unwrap()
+                .preview_surfaces
+                .get(&snap.key)
+                .is_some_and(|prec| prec.generation == snap.generation)
+        };
+        let no_anim = self.shared.lock().unwrap().transition_name == "none"
+            || make_transition("fade")
+                .map(|e| e.duration_ms() <= 0)
+                .unwrap_or(true);
+        if !no_anim {
+            let effect = make_transition("fade").expect("checked duration above");
+            // Reverse ramp: image back to transparent black.
+            let to = vec![0u8; snap.from.len()];
+            let frames = (i64::from(effect.duration_ms()) * ANIM_FPS as i64 / 1000).max(1);
+            let frame_ns = 1_000_000_000u64 / ANIM_FPS;
+            let t0 = Instant::now();
+            let mut buf_a = vec![0u8; snap.from.len()];
+            let mut buf_b = vec![0u8; snap.from.len()];
+            for i in 1..=frames {
+                if !is_current() {
+                    // Superseded by a newer show/clear. Fall through to the
+                    // generation-guarded unmap below: it no-ops when a newer
+                    // operation owns the record, and still clears pixels if
+                    // the record is somehow orphaned unmapped.
+                    break;
+                }
+                let progress = i as f64 / frames as f64;
+                let frame: &[u8] = if i % 2 == 1 {
+                    effect.render_into(
+                        &snap.from,
+                        &to,
+                        &mut buf_a,
+                        snap.w,
+                        snap.h,
+                        progress,
+                        SlideDir::None,
+                    );
+                    &buf_a
+                } else {
+                    effect.render_into(
+                        &snap.from,
+                        &to,
+                        &mut buf_b,
+                        snap.w,
+                        snap.h,
+                        progress,
+                        SlideDir::None,
+                    );
+                    &buf_b
+                };
+                let ok = {
+                    let mut guard = self.shared.lock().unwrap();
+                    match guard.preview_surfaces.get_mut(&snap.key) {
+                        Some(prec)
+                            if prec.generation == snap.generation
+                                && prec.configured
+                                && prec.surface.is_some()
+                                && prec.layer.is_some() =>
+                        {
+                            prec.alpha = 1.0 - progress as f32;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if !ok {
+                    // Record changed shape mid-fade (surface retired,
+                    // superseded). Stop fading but never return past a
+                    // record that may still hold pixels: fall through to
+                    // the generation-guarded unmap.
+                    break;
+                }
+                attach_preview_pixels_locked(
+                    &self.shared,
+                    snap.key,
+                    frame,
+                    snap.w,
+                    snap.h,
+                    snap.generation,
+                    false,
+                );
+                if i < frames {
+                    let deadline = t0 + Duration::from_nanos(frame_ns * i as u64);
+                    let now = Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
+                    }
+                }
+            }
+        }
+        // Finish with a nil attach: unmap so the background shows through.
+        unmap_preview_locked(&self.shared, snap.key, snap.generation);
+        true
+    }
+
+    /// Instantly dismiss the preview overlay on a monitor: no animation
+    /// (cut). Bumps the record generation (aborts any in-flight show/clear
+    /// loop via the existing generation guard), drops `pending` so a later
+    /// configure cannot resurrect, then nil-attaches/unmaps with
+    /// `mapped = false`, `alpha = 0.0`. Unknown/idle monitor → `true`
+    /// (idempotent, like `clear_preview`). Used by the workspace-switch
+    /// cancel and `set`-supersede paths, where the switch's own transition
+    /// carries the motion; explicit `preview-clear` and the 5s watchdog
+    /// keep the fading `clear_preview`.
+    pub fn drop_preview(&self, monitor: &str) -> bool {
+        drain_graveyard(&self.shared);
+        let (key, generation) = {
+            let mut guard = self.shared.lock().unwrap();
+            let key = match guard.find_key(monitor) {
+                // Unknown monitor: nothing to dismiss (idempotent).
+                Some(key) => key,
+                None => return true,
+            };
+            let prec = match guard.preview_surfaces.get_mut(&key) {
+                Some(prec) => prec,
+                None => return true,
+            };
+            prec.generation = prec.generation.wrapping_add(1);
+            prec.pending = None;
+            // Pending-only/idle records early-return; a possibly-presented
+            // but unmapped record (stale frame cache/opacity) falls through
+            // to the unmap below — never early-true past it.
+            if !prec.mapped && prec.last_frame.is_empty() && prec.alpha <= 0.0 {
+                return true;
+            }
+            (key, prec.generation)
+        };
+        unmap_preview_locked(&self.shared, key, generation);
+        true
+    }
+
+    /// Whether the monitor currently shows a preview overlay (mapped with
+    /// nonzero opacity).
+    pub fn has_preview(&self, monitor: &str) -> bool {
+        drain_graveyard(&self.shared);
+        let guard = self.shared.lock().unwrap();
+        guard
+            .find_key(monitor)
+            .and_then(|key| guard.preview_surfaces.get(&key))
+            .is_some_and(|prec| prec.mapped && prec.alpha > 0.0)
+    }
+
     pub fn running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -1572,6 +2764,7 @@ mod tests {
             layer_shell: Some(layer_shell),
             xdg_mgr: Some(xdg_mgr),
             outputs: HashMap::new(),
+            preview_surfaces: HashMap::new(),
             graveyard: Vec::new(),
             pending_by_monitor: HashMap::new(),
             transition_name: "slide".to_owned(),
@@ -1623,6 +2816,63 @@ mod tests {
             _conn: conn,
             _queue: queue,
         }
+    }
+
+    /// [`WaylandBackend`] wrapping a fixture [`Shared`] (headless: no
+    /// dispatch thread, proxy traffic only enqueues).
+    fn test_backend(shared: &Arc<Mutex<Shared>>) -> WaylandBackend {
+        WaylandBackend {
+            shared: Arc::clone(shared),
+            running: Arc::new(AtomicBool::new(false)),
+            dispatch: Mutex::new(None),
+        }
+    }
+
+    /// Headless backend from [`fixture`] plus a fabricated Overlay preview
+    /// record for "DP-1" (surface/layer are enqueued proxies, configured so
+    /// preview attaches proceed without compositor traffic).
+    fn preview_fixture() -> Fixture {
+        let f = fixture();
+        let (compositor, layer_shell, qh, output) = {
+            let guard = f.shared.lock().unwrap();
+            (
+                guard.compositor.clone().unwrap(),
+                guard.layer_shell.clone().unwrap(),
+                guard.qh.clone().unwrap(),
+                guard.outputs.get(&f.key).unwrap().output.clone(),
+            )
+        };
+        let surface: wl_surface::WlSurface = compositor.create_surface(&qh, ());
+        let layer = layer_shell.get_layer_surface(
+            &surface,
+            Some(&output),
+            zwlr_layer_shell_v1::Layer::Overlay,
+            "walleclipse-preview".to_owned(),
+            &qh,
+            PreviewLayerTag(f.key),
+        );
+        f.shared.lock().unwrap().preview_surfaces.insert(
+            f.key,
+            PreviewRecord {
+                surface: Some(surface),
+                layer: Some(layer),
+                slots: [None, None],
+                slot_idx: 0,
+                buf_seq: 0,
+                configured: true,
+                cfg_w: 4,
+                cfg_h: 4,
+                mapped: false,
+                pending: None,
+                last_frame: Vec::new(),
+                last_w: 0,
+                last_h: 0,
+                scaled: ScaledCache::new(),
+                alpha: 0.0,
+                generation: 1,
+            },
+        );
+        f
     }
 
     #[test]
@@ -1791,5 +3041,519 @@ mod tests {
             assert!(guard.pending_by_monitor.contains_key("DP-1"));
             assert_eq!(guard.transition_name, "slide");
         }
+    }
+
+    #[test]
+    fn show_preview_unknown_monitor_returns_false() {
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(!backend.show_preview("NOPE", Arc::clone(&f.img)));
+        assert!(!backend.has_preview("NOPE"));
+    }
+
+    #[test]
+    fn clear_preview_idle_returns_true() {
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(!backend.has_preview("DP-1"));
+        assert!(backend.clear_preview("DP-1"));
+        assert!(backend.clear_preview("NOPE"));
+    }
+
+    #[test]
+    fn preview_state_tracks_show_clear() {
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(!backend.has_preview("DP-1"));
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        assert_eq!(f.shared.lock().unwrap().preview_surfaces.len(), 1);
+        // Re-preview replaces in place (no second record).
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        assert_eq!(f.shared.lock().unwrap().preview_surfaces.len(), 1);
+        assert!(backend.clear_preview("DP-1"));
+        assert!(!backend.has_preview("DP-1"));
+        // Clearing an idle monitor stays a no-op true.
+        assert!(backend.clear_preview("DP-1"));
+    }
+
+    #[test]
+    fn drop_preview_cuts_instantly() {
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        let fade_ms = make_transition("fade")
+            .map(|e| e.duration_ms())
+            .unwrap_or(0);
+        let t0 = Instant::now();
+        assert!(backend.drop_preview("DP-1"));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(fade_ms.max(1) as u64),
+            "drop_preview must cut without the {fade_ms}ms fade (took {elapsed:?})"
+        );
+        assert!(!backend.has_preview("DP-1"));
+        let guard = f.shared.lock().unwrap();
+        let prec = guard.preview_surfaces.get(&f.key).unwrap();
+        assert!(!prec.mapped);
+        assert_eq!(prec.alpha, 0.0);
+        drop(guard);
+        // Unknown monitor stays a no-op true.
+        assert!(backend.drop_preview("NOPE"));
+    }
+
+    #[test]
+    fn preview_instant_show_stays_pending_until_attach() {
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        f.shared.lock().unwrap().transition_name = "none".to_owned();
+        // Take the surface (layer kept, so no rebuild): the instant attach
+        // cannot proceed and the record must stay pending, not shown.
+        let surface = f
+            .shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get_mut(&f.key)
+            .unwrap()
+            .surface
+            .take();
+        assert!(surface.is_some());
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(
+            !backend.has_preview("DP-1"),
+            "no pixels attached: accepted/pending, not presenting"
+        );
+        assert!(
+            f.shared
+                .lock()
+                .unwrap()
+                .preview_surfaces
+                .get(&f.key)
+                .unwrap()
+                .pending
+                .is_some(),
+            "pending image survives for the configure handler"
+        );
+        // Surface back (configure ack): re-show presents.
+        f.shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get_mut(&f.key)
+            .unwrap()
+            .surface = surface;
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        assert!(backend.clear_preview("DP-1"));
+        assert!(!backend.has_preview("DP-1"));
+    }
+
+    /// Mark the fixture's preview record unconfigured, returning its key.
+    /// The next `show_preview` then pends (accepted, nothing presented)
+    /// exactly like a show racing surface creation on a live compositor.
+    fn pend_preview_surface(shared: &Arc<Mutex<Shared>>, key: u32) {
+        shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get_mut(&key)
+            .unwrap()
+            .configured = false;
+    }
+
+    /// Drive the compositor configure the pending show is waiting for:
+    /// mark configured and run the configure handler's attach path.
+    fn drive_preview_configure(shared: &Arc<Mutex<Shared>>, key: u32) {
+        shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get_mut(&key)
+            .unwrap()
+            .configured = true;
+        attach_preview_locked(shared, key);
+    }
+
+    fn prec_mapped(shared: &Arc<Mutex<Shared>>, key: u32) -> bool {
+        shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get(&key)
+            .unwrap()
+            .mapped
+    }
+
+    fn prec_pending_is_some(shared: &Arc<Mutex<Shared>>, key: u32) -> bool {
+        shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get(&key)
+            .unwrap()
+            .pending
+            .is_some()
+    }
+
+    #[test]
+    fn pending_show_then_cut_stays_cleared_after_configure() {
+        // Control arm: pending show with NO cut resurrects on configure
+        // (proves the fixture can actually resurrect — `mapped` flips).
+        let c = preview_fixture();
+        let c_backend = test_backend(&c.shared);
+        pend_preview_surface(&c.shared, c.key);
+        assert!(c_backend.show_preview("DP-1", Arc::clone(&c.img)));
+        assert!(
+            !c_backend.has_preview("DP-1"),
+            "pending show must not present yet"
+        );
+        drive_preview_configure(&c.shared, c.key);
+        assert!(
+            prec_mapped(&c.shared, c.key),
+            "control: configure attaches the pending show"
+        );
+        // Fixed arm: the cut path (`drop_preview`, unconditional) clears
+        // `pending` + bumps generation, so the same configure resurrects
+        // nothing.
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        pend_preview_surface(&f.shared, f.key);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(!backend.has_preview("DP-1"));
+        assert!(
+            prec_pending_is_some(&f.shared, f.key),
+            "show pends for configure"
+        );
+        assert!(backend.drop_preview("DP-1"));
+        assert!(
+            !prec_pending_is_some(&f.shared, f.key),
+            "cut must drop the pending image even though mapped == false"
+        );
+        drive_preview_configure(&f.shared, f.key);
+        assert!(!backend.has_preview("DP-1"));
+        assert!(
+            !prec_mapped(&f.shared, f.key),
+            "cut preview must not resurrect on configure"
+        );
+        // Same invariant through the fading dismiss path: `clear_preview`
+        // on the unmapped record still drops `pending`.
+        let g = preview_fixture();
+        let g_backend = test_backend(&g.shared);
+        pend_preview_surface(&g.shared, g.key);
+        assert!(g_backend.show_preview("DP-1", Arc::clone(&g.img)));
+        assert!(g_backend.clear_preview("DP-1"));
+        assert!(
+            !prec_pending_is_some(&g.shared, g.key),
+            "clear must drop pending even though mapped == false"
+        );
+        drive_preview_configure(&g.shared, g.key);
+        assert!(!g_backend.has_preview("DP-1"));
+        assert!(
+            !prec_mapped(&g.shared, g.key),
+            "cleared preview must not resurrect on configure"
+        );
+    }
+
+    #[test]
+    fn superseded_pin_does_not_rearm_preview() {
+        // Fault injection for the animated show's final pin: the loop is
+        // synchronous, so a clear cannot be interleaved mid-call without
+        // restructuring it (expressly out of scope). Instead, present via
+        // the real path, land a real superseding clear (generation bump +
+        // unmap — exactly what a clear between the last frame and the pin
+        // does to the record), then assert the pin's currency guard leaves
+        // the dismissed preview down.
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        let stale_gen = f
+            .shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get(&f.key)
+            .unwrap()
+            .generation;
+        // The superseding clear.
+        assert!(backend.drop_preview("DP-1"));
+        assert!(!backend.has_preview("DP-1"));
+        // The stale pin's guard (`is_current`, i.e. generation equality)
+        // must now read stale, so its `mapped = true, alpha = 1.0` store
+        // must not run. Mirror the pin's guard exactly against the live
+        // record: the store fires only when current.
+        {
+            let mut guard = f.shared.lock().unwrap();
+            if let Some(prec) = guard.preview_surfaces.get_mut(&f.key) {
+                let current = prec.generation == stale_gen;
+                assert!(!current, "clear must disarm the in-flight show's pin");
+                if current {
+                    prec.mapped = true;
+                    prec.alpha = 1.0;
+                }
+            }
+        }
+        assert!(
+            !backend.has_preview("DP-1"),
+            "stale pin must not re-arm a dismissed preview"
+        );
+        assert!(
+            !prec_mapped(&f.shared, f.key),
+            "record stays unmapped after the stale pin"
+        );
+    }
+
+    #[test]
+    fn show_on_unconfigured_record_attaches_nothing_until_configure() {
+        // Attach-before-configure gate: on a fresh (never-configured)
+        // record every show path must pend with ZERO buffer attaches until
+        // the configure handler runs. Observed via the attach counter
+        // (`buf_seq` bumps only on the write/create/attach path) and slot
+        // state (no pools/buffers may exist before the first legal attach).
+        for transition in ["slide", "none"] {
+            let f = preview_fixture();
+            let backend = test_backend(&f.shared);
+            f.shared.lock().unwrap().transition_name = transition.to_owned();
+            pend_preview_surface(&f.shared, f.key); // configured = false
+            assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+            assert!(
+                !backend.has_preview("DP-1"),
+                "nothing may present before configure ({transition})"
+            );
+            {
+                let guard = f.shared.lock().unwrap();
+                let prec = guard.preview_surfaces.get(&f.key).unwrap();
+                assert!(!prec.mapped, "unconfigured show stays unmapped");
+                assert_eq!(
+                    prec.buf_seq, 0,
+                    "zero attaches issued before configure ({transition})"
+                );
+                assert!(
+                    prec.slots.iter().all(|s| s.is_none()),
+                    "no SHM slots may exist before configure ({transition})"
+                );
+                assert!(
+                    prec.pending.is_some(),
+                    "image pends for the configure handler"
+                );
+            }
+            drive_preview_configure(&f.shared, f.key);
+            assert!(
+                backend.has_preview("DP-1"),
+                "pending show presents once configured ({transition})"
+            );
+            assert!(backend.clear_preview("DP-1"));
+            assert!(!backend.has_preview("DP-1"));
+        }
+    }
+
+    #[test]
+    fn reshow_after_unmap_waits_for_a_fresh_configure() {
+        // Root cause of the dead-connection bug (Wayland trace,
+        // 2026-10-14): a NULL commit by clear/drop unmaps the layer
+        // surface, which makes it unconfigured again — but the record
+        // kept `configured = true`, so the next show attached a buffer
+        // straight away and the compositor raised
+        //   "layerSurface was not configured, but a buffer was attached"
+        // and killed the whole wl_display connection. Everything then
+        // looked alive (IPC still replied OK) while nothing was painted:
+        // black background and no further previews.
+        // After an unmap the record must read unconfigured, and the next
+        // show must pend with zero attaches until a fresh configure.
+        for transition in ["slide", "none"] {
+            let f = preview_fixture();
+            let backend = test_backend(&f.shared);
+            f.shared.lock().unwrap().transition_name = transition.to_owned();
+
+            assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+            assert!(backend.has_preview("DP-1"));
+
+            // A dismiss nil-attaches the surface: the overlay is unmapped.
+            assert!(backend.drop_preview("DP-1"));
+            assert!(!prec_mapped(&f.shared, f.key));
+
+            let attaches_at_unmap = {
+                let guard = f.shared.lock().unwrap();
+                let prec = guard.preview_surfaces.get(&f.key).unwrap();
+                assert!(
+                    !prec.configured,
+                    "an unmapped layer surface is unconfigured again ({transition})"
+                );
+                prec.buf_seq
+            };
+
+            // Second show must not attach anything before the reconfigure.
+            assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+            assert!(
+                !backend.has_preview("DP-1"),
+                "post-unmap show must pend, never present early ({transition})"
+            );
+            {
+                let guard = f.shared.lock().unwrap();
+                let prec = guard.preview_surfaces.get(&f.key).unwrap();
+                assert_eq!(
+                    prec.buf_seq, attaches_at_unmap,
+                    "no buffer may attach between unmap and reconfigure ({transition})"
+                );
+                assert!(
+                    prec.pending.is_some(),
+                    "image pends for the configure handler ({transition})"
+                );
+            }
+
+            // The fresh configure the empty commit asked for arrives.
+            drive_preview_configure(&f.shared, f.key);
+            assert!(
+                backend.has_preview("DP-1"),
+                "post-unmap show presents once reconfigured ({transition})"
+            );
+        }
+    }
+
+    #[test]
+    fn aborted_show_then_clear_still_dismisses() {
+        // A show orphaned mid-fade by a racing clear's generation bump must
+        // not strand pixels: the following clear still runs to unmap (not
+        // an early-true without unmap).
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        {
+            let mut guard = f.shared.lock().unwrap();
+            let prec = guard.preview_surfaces.get_mut(&f.key).unwrap();
+            prec.generation = prec.generation.wrapping_add(1);
+        }
+        assert!(backend.clear_preview("DP-1"));
+        assert!(!backend.has_preview("DP-1"));
+        let guard = f.shared.lock().unwrap();
+        let prec = guard.preview_surfaces.get(&f.key).unwrap();
+        assert!(!prec.mapped);
+        assert!(prec.last_frame.is_empty());
+        assert!(prec.pending.is_none());
+    }
+
+    #[test]
+    fn clear_and_drop_on_desynced_record_still_unmap() {
+        // Flag/state desync guard: pixels attached (live frame cache +
+        // opacity) but `mapped` reading false. Neither dismiss path may
+        // early-true past a possibly-presented record — both must unmap.
+        // (Fault injection mirrors `superseded_pin_does_not_rearm_preview`.)
+        for dismiss in ["clear", "drop"] {
+            let f = preview_fixture();
+            let backend = test_backend(&f.shared);
+            assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+            assert!(backend.has_preview("DP-1"));
+            {
+                let mut guard = f.shared.lock().unwrap();
+                guard.preview_surfaces.get_mut(&f.key).unwrap().mapped = false;
+            }
+            let ok = if dismiss == "clear" {
+                backend.clear_preview("DP-1")
+            } else {
+                backend.drop_preview("DP-1")
+            };
+            assert!(ok, "{dismiss} stays idempotent-true");
+            assert!(!backend.has_preview("DP-1"));
+            let guard = f.shared.lock().unwrap();
+            let prec = guard.preview_surfaces.get(&f.key).unwrap();
+            assert!(!prec.mapped, "{dismiss}: stays unmapped");
+            assert_eq!(prec.alpha, 0.0, "{dismiss}: opacity reset");
+            assert!(
+                prec.last_frame.is_empty(),
+                "{dismiss}: must unmap past a possibly-presented record, not early-true"
+            );
+            assert!(prec.pending.is_none(), "{dismiss}: pending dropped");
+        }
+    }
+
+    #[test]
+    fn stale_attach_cannot_rearm_after_unmap() {
+        // Root-cause guard for the stuck overlay: an aborted show's frame
+        // can reach the attach after a clear already unmapped the record.
+        // A generation-guarded attach must refuse it outright — no buffer
+        // commit, no `mapped` pin — so pixels cannot reappear over a
+        // dismissal and leave `mapped` lying about what is on screen.
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        let stale_gen = f
+            .shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get(&f.key)
+            .unwrap()
+            .generation;
+        // A clear supersedes (generation bump) and unmaps.
+        assert!(backend.drop_preview("DP-1"));
+        assert!(!prec_mapped(&f.shared, f.key));
+        let argb = vec![0u8; 4 * 4 * 4];
+        assert!(
+            !attach_preview_pixels_locked(&f.shared, f.key, &argb, 4, 4, stale_gen, true),
+            "stale-generation attach must be refused"
+        );
+        assert!(
+            !prec_mapped(&f.shared, f.key),
+            "stale attach must not re-arm the dismissed record"
+        );
+        let guard = f.shared.lock().unwrap();
+        let prec = guard.preview_surfaces.get(&f.key).unwrap();
+        assert!(
+            prec.last_frame.is_empty(),
+            "stale attach must not store a frame"
+        );
+        drop(guard);
+        // Control: a current-generation attach on the same fixture shape
+        // does land, so the assertion above is sensitive.
+        let c = preview_fixture();
+        let c_gen = c
+            .shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get(&c.key)
+            .unwrap()
+            .generation;
+        assert!(
+            attach_preview_pixels_locked(&c.shared, c.key, &argb, 4, 4, c_gen, true),
+            "control: current-generation attach lands"
+        );
+        assert!(prec_mapped(&c.shared, c.key));
+    }
+
+    #[test]
+    fn clear_aborting_fade_still_unmaps() {
+        // `clear_preview` must never early-return past a possibly-presented
+        // record. Simulate the record going unconfigured between the clear
+        // snapshot (which snapshots a mapped frame) and its first fade
+        // frame: the fade gate aborts, but the generation-guarded unmap
+        // must still run instead of returning `true` with pixels intact.
+        let f = preview_fixture();
+        let backend = test_backend(&f.shared);
+        assert!(backend.show_preview("DP-1", Arc::clone(&f.img)));
+        assert!(backend.has_preview("DP-1"));
+        f.shared
+            .lock()
+            .unwrap()
+            .preview_surfaces
+            .get_mut(&f.key)
+            .unwrap()
+            .configured = false;
+        assert!(backend.clear_preview("DP-1"));
+        assert!(!backend.has_preview("DP-1"));
+        let guard = f.shared.lock().unwrap();
+        let prec = guard.preview_surfaces.get(&f.key).unwrap();
+        assert!(!prec.mapped, "aborted clear must still unmap");
+        assert_eq!(prec.alpha, 0.0, "aborted clear resets opacity");
+        assert!(
+            prec.last_frame.is_empty(),
+            "aborted clear must clear the frame cache"
+        );
+        assert!(prec.pending.is_none(), "aborted clear drops pending");
     }
 }

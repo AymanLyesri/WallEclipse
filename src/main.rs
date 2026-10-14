@@ -45,6 +45,8 @@ fn help_text(argv0: &str) -> String {
          \x20 {argv0} preload PATH     preload into daemon cache\n\
          \x20 {argv0} reload           re-read config + re-apply current\n\
          \x20 {argv0} transition [name] query/set workspace transition\n\
+         \x20 {argv0} preview MON PATH  fullscreen preview (auto-dismiss)\n\
+         \x20 {argv0} preview-clear [MON]  dismiss preview\n\
          \x20 {argv0} current|list     query daemon\n",
         env!("CARGO_PKG_VERSION"),
     )
@@ -87,6 +89,7 @@ struct ShowCtx {
     backend: Arc<WaylandBackend>,
     shown: Arc<Mutex<HashMap<String, String>>>,
     current_conf: std::path::PathBuf,
+    preview_gen: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 fn get_shown(shown: &Arc<Mutex<HashMap<String, String>>>, mon: &str) -> String {
@@ -103,6 +106,60 @@ fn set_shown(shown: &Arc<Mutex<HashMap<String, String>>>, mon: &str, path: &str)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(mon.to_string(), path.to_string());
+}
+
+/// Preview watchdog generation: bumped on every preview show and every
+/// preview clear (single-monitor or all). A watchdog thread captures the
+/// gen at arm time and only auto-dismisses while it is still current, so
+/// a re-preview or an explicit clear disarms the older watchdog.
+fn next_gen(map: &Mutex<HashMap<String, u64>>, mon: &str) -> u64 {
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = guard.entry(mon.to_string()).or_insert(0);
+    *slot = slot.wrapping_add(1);
+    *slot
+}
+
+fn is_current(map: &Mutex<HashMap<String, u64>>, mon: &str, gen: u64) -> bool {
+    map.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(mon)
+        .is_some_and(|&g| g == gen)
+}
+
+/// `preview` needs `<monitor> <path>` after the subcommand: `args.len() >= 4`.
+fn check_preview_args(len: usize) -> bool {
+    len >= 4
+}
+
+/// Cancel a live preview on `mon` before a workspace switch / `set` takes
+/// over, and disarm its watchdog. Instant cut (no fade): the switch's own
+/// transition carries the motion. Runs synchronously.
+///
+/// `drop_preview` is called UNCONDITIONALLY (never gated on
+/// `has_preview`): a pending-but-unmapped show (`mapped == false`) must
+/// still have its `pending` image dropped and its generation bumped, or a
+/// later configure would resurrect it with the watchdog disarmed.
+fn cut_preview(ctx: &ShowCtx, mon: &str) {
+    next_gen(&ctx.preview_gen, mon);
+    ctx.backend.drop_preview(mon);
+}
+
+/// Explicit user / watchdog dismiss path: fading `clear_preview` plus a
+/// watchdog-disarming generation bump.
+///
+/// Like `cut_preview`, the `clear_preview` call is UNCONDITIONAL: it
+/// clears `pending` first, so a pending-but-unmapped show cannot survive
+/// to be resurrected by a later configure.
+///
+/// Test-only since the async `preview-clear` handler bumps at dispatch
+/// and fades in its worker: no production caller pairs bump+clear
+/// synchronously anymore. Kept (not inlined into the test) as the
+/// canonical atomic pair for future sync callers.
+///
+#[cfg(test)]
+fn disarm_preview(ctx: &ShowCtx, mon: &str) {
+    next_gen(&ctx.preview_gen, mon);
+    ctx.backend.clear_preview(mon);
 }
 
 /// Poster with on-demand extraction (first visit pays ~250ms once,
@@ -272,6 +329,21 @@ fn run() -> i32 {
         }
         return run_client(&req);
     }
+    if args.len() >= 2 && args[1] == "preview" {
+        if !check_preview_args(args.len()) {
+            eprintln!("Usage: walleclipse preview <monitor> <path>");
+            return 2;
+        }
+        return run_client(&format!("PREVIEW {} {}", args[2], args[3]));
+    }
+    if args.len() >= 2 && args[1] == "preview-clear" {
+        let mut req = "PREVIEW_CLEAR".to_string();
+        if args.len() >= 3 {
+            req += " ";
+            req += &args[2];
+        }
+        return run_client(&req);
+    }
     if args.len() >= 2 && (args[1] == "--help" || args[1] == "-h") {
         print!("{}", help_text(&argv0));
         let _ = std::io::stdout().flush();
@@ -370,6 +442,7 @@ fn run() -> i32 {
         backend: Arc::clone(&backend),
         shown: Arc::new(Mutex::new(HashMap::new())),
         current_conf: store.base_dir().join("current.conf"),
+        preview_gen: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let listener: Arc<HyprListener> = Arc::new_cyclic(|weak: &Weak<HyprListener>| {
@@ -384,6 +457,8 @@ fn run() -> i32 {
             Arc::new(
                 move |mon: &str, path: &str, dir: SlideDir, _from: i32, _to: i32| {
                     let l = w_static.upgrade();
+                    // A workspace switch supersedes any live hover preview.
+                    cut_preview(&static_ctx, mon);
                     if is_media_wallpaper(path) {
                         show_animated_now(&static_ctx, l.as_deref(), mon, path, dir);
                     } else {
@@ -395,6 +470,7 @@ fn run() -> i32 {
             Arc::new(
                 move |mon: &str, path: &str, dir: SlideDir, _from: i32, _to: i32| {
                     let l = w_anim.upgrade();
+                    cut_preview(&anim_ctx, mon);
                     show_animated_now(&anim_ctx, l.as_deref(), mon, path, dir);
                 },
             ),
@@ -415,6 +491,8 @@ fn run() -> i32 {
             let trans_ctx = Arc::clone(&ctx);
             let set_ctx = Arc::clone(&ctx);
             let set_listener = Arc::clone(&listener);
+            let preview_ctx = Arc::clone(&ctx);
+            let clear_ctx = Arc::clone(&ctx);
             let list_store = Arc::clone(&ctx.store);
             let current_conf = ctx.current_conf.clone();
             let handlers = ipc::Handlers {
@@ -448,6 +526,8 @@ fn run() -> i32 {
                     if !set_ctx.store.set_wallpaper(mon, ws, path) {
                         return false;
                     }
+                    // A set supersedes any live hover preview on this monitor.
+                    cut_preview(&set_ctx, mon);
                     // No slide out-of-band; reuse the same show path with None dir.
                     // Warm the cache first so the next switch slides.
                     if is_media_wallpaper(path) {
@@ -482,6 +562,81 @@ fn run() -> i32 {
                 })),
                 quit: Some(Arc::new(|| {
                     log_line("ipc", "quit requested");
+                })),
+                // Hover preview on the Overlay surface (Task 3, async dispatch
+                // Task 4): resolve the image synchronously (video -> poster,
+                // failure -> false preserves ERR for undecodable paths), then
+                // bump the generation and show on a detached worker so the
+                // accept loop replies OK immediately. Overlapping workers are
+                // cheap: every show/clear bumps the record generation, so a
+                // superseded loop aborts in ~1 frame.
+                preview: Some(Arc::new(move |mon: &str, path: &str| {
+                    let img: Arc<DecodedImage> = if is_media_wallpaper(path) {
+                        match poster_for(&preview_ctx.preloader, path) {
+                            Some(p) => p,
+                            None => {
+                                log_line("preview", &format!("cannot extract poster for '{path}'"));
+                                return false;
+                            }
+                        }
+                    } else {
+                        match resolve_image(path) {
+                            Some(img) => Arc::new(img),
+                            None => {
+                                log_line("preview", &format!("cannot decode '{path}'"));
+                                return false;
+                            }
+                        }
+                    };
+                    // Disarm any older watchdog / in-flight show now, so a
+                    // re-preview inside the old 5s window is not eaten by it.
+                    let gen = next_gen(&preview_ctx.preview_gen, mon);
+                    let mon_owned = mon.to_string();
+                    let worker_ctx = Arc::clone(&preview_ctx);
+                    std::thread::spawn(move || {
+                        if !worker_ctx.backend.show_preview(&mon_owned, img) {
+                            log_line("preview", &format!("preview show failed for '{mon_owned}'"));
+                            return;
+                        }
+                        // Watchdog: already off-loop, sleep inline (one
+                        // thread per accepted preview, as before).
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        if is_current(&worker_ctx.preview_gen, &mon_owned, gen) {
+                            worker_ctx.backend.clear_preview(&mon_owned);
+                            log_line("preview", "preview auto-dismiss");
+                        }
+                    });
+                    true
+                })),
+                // Dismiss preview: "" clears all previewing monitors, else one.
+                // Idempotent: always OK. The fading clear runs on a detached
+                // worker so the accept loop never blocks on the fade; the
+                // instant `drop_preview` cut stays synchronous at the
+                // switch/set call sites that depend on immediacy.
+                preview_clear: Some(Arc::new(move |mon: &str| {
+                    // Bump at DISPATCH (not in the worker): a clear→preview
+                    // pair inside worker-spawn latency must not bump out of
+                    // order and abort the new show. The "" fan-out list is
+                    // snapshotted here too; the worker only runs the fading
+                    // `clear_preview` per mon (record-gen guard inside still
+                    // aborts any in-flight show).
+                    let mons: Vec<String> = if mon.is_empty() {
+                        let mons = clear_ctx.backend.outputs();
+                        for m in &mons {
+                            next_gen(&clear_ctx.preview_gen, m);
+                        }
+                        mons
+                    } else {
+                        next_gen(&clear_ctx.preview_gen, mon);
+                        vec![mon.to_string()]
+                    };
+                    let worker_ctx = Arc::clone(&clear_ctx);
+                    std::thread::spawn(move || {
+                        for m in &mons {
+                            worker_ctx.backend.clear_preview(m);
+                        }
+                    });
+                    true
                 })),
             };
             if !ipc::serve(handlers) {
@@ -521,6 +676,8 @@ mod tests {
             "reload",
             "transition [name]",
             "current|list",
+            "preview MON PATH",
+            "preview-clear",
         ] {
             assert!(h.contains(want), "missing {want:?} in:\n{h}");
         }
@@ -530,6 +687,63 @@ mod tests {
     fn help_uses_argv0() {
         let h = help_text("walleclipse");
         assert!(h.contains("walleclipse set MON WS PATH"));
+    }
+
+    #[test]
+    fn preview_generation_reset() {
+        let map = Mutex::new(HashMap::<String, u64>::new());
+        let g1 = next_gen(&map, "DP-1");
+        let g2 = next_gen(&map, "DP-1");
+        assert_ne!(g1, g2);
+        assert!(!is_current(&map, "DP-1", g1));
+        assert!(is_current(&map, "DP-1", g2));
+        // Clear bumps: both gens go stale.
+        let _ = next_gen(&map, "DP-1");
+        assert!(!is_current(&map, "DP-1", g1));
+        assert!(!is_current(&map, "DP-1", g2));
+    }
+
+    #[test]
+    fn set_supersedes_preview() {
+        let map = Mutex::new(HashMap::<String, u64>::new());
+        let preview_gen = next_gen(&map, "DP-1");
+        assert!(is_current(&map, "DP-1", preview_gen));
+        // The set path bumps the same map: the preview gen reads stale.
+        let _ = next_gen(&map, "DP-1");
+        assert!(!is_current(&map, "DP-1", preview_gen));
+    }
+
+    #[test]
+    fn preview_arg_parsing() {
+        assert!(!check_preview_args(2));
+        assert!(!check_preview_args(3));
+        assert!(check_preview_args(4));
+        assert!(check_preview_args(5));
+    }
+
+    #[test]
+    fn cut_and_disarm_bump_gen_without_live_preview() {
+        // Headless backend (no outputs): `has_preview` is false, so the
+        // old `has_preview`-gated paths skipped the dismiss entirely. The
+        // daemon-side generation bump must still fire unconditionally, or
+        // a pending-but-unmapped show keeps an armed watchdog that a later
+        // configure can resurrect.
+        let dir = std::env::temp_dir().join(format!(
+            "walleclipse-rust-test-cut-disarm-{}",
+            std::process::id()
+        ));
+        let ctx = ShowCtx {
+            store: Arc::new(ConfigStore::new(&dir)),
+            preloader: Arc::new(Preloader::new(1)),
+            backend: Arc::new(WaylandBackend::new()),
+            shown: Arc::new(Mutex::new(HashMap::new())),
+            current_conf: dir.join("current.conf"),
+            preview_gen: Arc::new(Mutex::new(HashMap::new())),
+        };
+        cut_preview(&ctx, "DP-1");
+        assert!(is_current(&ctx.preview_gen, "DP-1", 1));
+        disarm_preview(&ctx, "DP-1");
+        assert!(is_current(&ctx.preview_gen, "DP-1", 2));
     }
 
     #[test]

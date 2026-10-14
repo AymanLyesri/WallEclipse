@@ -20,6 +20,8 @@ fn help_lists_all_subcommands() {
         "reload",
         "transition [name]",
         "current|list",
+        "preview MON PATH",
+        "preview-clear",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
